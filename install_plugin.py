@@ -204,11 +204,14 @@ def get_gimp_plugins_dir():
     return None
 
 
+PLUGIN_FILES = ["gimp-ai-plugin.py", "coordinate_utils.py", "bedrock_client.py"]
+
+
 def find_plugin_files():
     """Find the plugin files in the current directory or parent directory"""
     current_dir = Path(__file__).parent
 
-    required_files = ["gimp-ai-plugin.py", "coordinate_utils.py"]
+    required_files = PLUGIN_FILES
 
     # Check current directory
     all_found = all((current_dir / f).exists() for f in required_files)
@@ -283,14 +286,11 @@ def install_plugin():
         print("❌ ERROR: Could not find plugin files!")
         print()
         print("Please make sure you have these files:")
-        print("  • gimp-ai-plugin.py")
-        print("  • coordinate_utils.py")
+        for filename in PLUGIN_FILES:
+            print(f"  • {filename}")
         print()
         print("They should be in the same directory as this installer.")
         return False
-
-    plugin_file = source_dir / "gimp-ai-plugin.py"
-    utils_file = source_dir / "coordinate_utils.py"
 
     print(f"✅ Found plugin files in: {source_dir}")
     print()
@@ -349,15 +349,12 @@ def install_plugin():
     # Copy plugin files
     print("📋 Copying plugin files...")
 
+    dest_plugin = os.path.join(plugin_dest_dir, "gimp-ai-plugin.py")
+
     try:
-        dest_plugin = os.path.join(plugin_dest_dir, "gimp-ai-plugin.py")
-        dest_utils = os.path.join(plugin_dest_dir, "coordinate_utils.py")
-
-        shutil.copy2(plugin_file, dest_plugin)
-        print(f"  ✅ gimp-ai-plugin.py")
-
-        shutil.copy2(utils_file, dest_utils)
-        print(f"  ✅ coordinate_utils.py")
+        for filename in PLUGIN_FILES:
+            shutil.copy2(source_dir / filename, os.path.join(plugin_dest_dir, filename))
+            print(f"  ✅ {filename}")
 
     except (IOError, PermissionError) as e:
         print(f"❌ ERROR copying files: {e}")
@@ -396,11 +393,23 @@ def print_next_steps():
     print("2. 🔍 Check for the AI menu:")
     print("   In GIMP: Filters → AI")
     print()
-    print("3. 🔑 Configure your API key:")
+    print("3. 🔑 Configure a provider:")
+    print()
+    print("   OpenAI (inpainting, generation and layer composite):")
     print("   a. Get an OpenAI API key from: https://platform.openai.com")
     print("   b. In GIMP: Filters → AI → Settings")
     print("   c. Paste your API key (starts with 'sk-')")
     print("   d. Click OK")
+    print()
+    print("   Amazon Bedrock (inpainting only, optional):")
+    print("   a. Enable model access for Stability AI inpainting at:")
+    print("      https://console.aws.amazon.com/bedrock/ → Model access")
+    print("   b. In GIMP: Filters → AI → Settings")
+    print("   c. Set 'Inpainting Provider' to Amazon Bedrock, set your region")
+    print("   d. Either paste a Bedrock API key, or leave it blank to use your")
+    print("      AWS credentials from the environment or ~/.aws")
+    print("      (sandboxed GIMP installs - snap, flatpak - cannot read ~/.aws,")
+    print("       so use the API key field or launch GIMP with AWS_* exported)")
     print()
     print("4. 🎨 Test the plugin:")
     print("   Try: Filters → AI → Image Generator")

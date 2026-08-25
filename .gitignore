@@ -3,3 +3,11 @@ tests/__pycache__
 *.pyc
 dist/
 *.zip
+tests/mask_test_result.txt
+tests/mask_test_*.png
+__pycache__/
+*.pyc
+tests/erase_test_*.png
+tests/erase_test_result.txt
+tests/probe_*.png
+tests/probe_result.txt

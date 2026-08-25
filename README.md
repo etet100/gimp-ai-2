@@ -2,25 +2,27 @@
 
 A Python plugin for GIMP 3.0.4+ that integrates AI image generation capabilities directly into GIMP. This is a **beta release** seeking testers on all platforms.
 
-Currently supports **OpenAI's gpt-image-1** models for inpainting and image generation. Future plans include support for additional AI providers.
+Supports **OpenAI's gpt-image-1** models for inpainting and image generation, and **Amazon Bedrock** (Stability AI inpainting) as an alternative provider for inpainting and layer compositing.
 
 ## ✨ Features
 
 - **🎨 AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
+- **🧹 AI Erase Object**: Remove something from a photo and fill the gap from its surroundings - select it, run it, no prompt, three alternatives to choose from
 - **🖼️ AI Image Generation**: Create new images from text descriptions as new layers
 - **🔄 AI Layer Composite**: Intelligently blend AI content into existing images
 - **⚙️ Easy Configuration**: Built-in settings dialog, no external config files needed
+- **☁️ Choice of provider**: Inpaint and composite through OpenAI or Amazon Bedrock
 
 ## 📋 Requirements
 
 - **GIMP 3.0.4 or newer** (all GIMP 3.X versions from 3.0.4 onwards)
 - **Internet connection** for AI API calls
-- **OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com))
+- **OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)), or **AWS credentials with Amazon Bedrock access** if you inpaint through Bedrock
 - **Zero external dependencies** - uses only Python standard library + GIMP APIs
 
 ## 🚀 Installation
 
-**Just 2 files to copy!** No external dependencies or complex setup.
+**Just 3 files to copy!** No external dependencies or complex setup.
 
 ### Easiest Way: Automated Installer 🎯
 
@@ -33,7 +35,7 @@ Done! The installer handles everything automatically.
 
 ### Manual Install (3 Simple Steps)
 
-1. **Download 2 files**: `gimp-ai-plugin.py` and `coordinate_utils.py`
+1. **Download 3 files**: `gimp-ai-plugin.py`, `coordinate_utils.py` and `bedrock_client.py`
 2. **Create folder**: Make a `gimp-ai-plugin` folder in your GIMP plug-ins directory
 3. **Copy files**: Put both files in that folder, restart GIMP
 
@@ -65,7 +67,8 @@ The installation guide includes:
 plug-ins/
 └── gimp-ai-plugin/          ← Create this folder
     ├── gimp-ai-plugin.py    ← Required file #1
-    └── coordinate_utils.py  ← Required file #2
+    ├── coordinate_utils.py  ← Required file #2
+    └── bedrock_client.py    ← Required file #3
 ```
 
 **After copying files:**
@@ -76,12 +79,50 @@ plug-ins/
 
 ## ⚙️ Configuration
 
+### OpenAI
+
 1. **Get an OpenAI API key** from [platform.openai.com](https://platform.openai.com)
 2. In GIMP: go to `Filters → AI → Settings`
 3. **Paste your API key** (starts with `sk-`)
 4. Click OK - it's saved automatically!
 
 > **First time?** See [INSTALL.md](INSTALL.md) for detailed API key instructions.
+
+### Amazon Bedrock (inpainting only)
+
+1. **Request model access** for Stability AI's inpainting model in the
+   [Bedrock console](https://console.aws.amazon.com/bedrock/) under Model access
+2. In GIMP: go to `Filters → AI → Settings`
+3. Set **Inpainting Provider** to *Amazon Bedrock*
+4. Set the **AWS region** you enabled the model in (default `us-east-1`)
+5. Provide credentials one of these ways:
+   - Type an **access key ID** and **secret access key** into the settings dialog.
+     They are saved to `config.json`, which is written with mode 600. Use the
+     *Clear Stored AWS Credentials* button to remove them again
+   - Or paste a [Bedrock API key](https://docs.aws.amazon.com/bedrock/latest/userguide/getting-started-api-keys.html)
+     instead of the two keys above
+   - Or leave every credential field blank and let the plugin read your existing
+     AWS credentials from the environment or `~/.aws` (`aws configure`)
+
+> **Sandboxed GIMP**: snap and flatpak builds cannot read `~/.aws` at all - only
+> `~/.config/GIMP` is visible to them. Either fill in the credential fields, or
+> launch GIMP from a terminal with `AWS_ACCESS_KEY_ID` and
+> `AWS_SECRET_ACCESS_KEY` exported.
+
+The default model is `stability.stable-image-inpaint-v1:0`, invoked through the
+cross-region inference profile for your region (`us.`, `eu.` or `apac.`), which
+the plugin adds automatically. Stability's older SDXL 1.0 model
+(`stability.stable-diffusion-xl-v1`) is no longer offered on Bedrock.
+
+Bedrock serves both **AI Inpainting** and **AI Layer Composite**. Image
+generation is OpenAI-only, since it needs a text-to-image model rather than an
+inpainting one.
+
+Layer composite behaves differently on the two providers. OpenAI receives each
+selected layer as a separate image and can use one as a reference for another.
+Bedrock's inpainting model takes a single image, so the selected layers are
+flattened by GIMP first and the model only ever sees the combined pixels; a
+selection mask is required to tell it which region to work on.
 
 ## 🎨 Usage
 
@@ -106,6 +147,44 @@ plug-ins/
 - **Smart feathering**: Automatic edge blending for seamless integration
 
 ⚠️ **Important**: The AI model may modify areas outside your selection to create coherent results. Only the final output is masked to your selection.
+
+### AI Erase Object
+
+**Remove an unwanted object and fill the gap from the surrounding image**
+
+1. **Select** the thing you want gone (any selection tool)
+2. **Go to** `Filters → AI → Erase Object`
+
+That is the whole workflow: no prompt, no options.
+
+You get **three alternative erasures** as three layers, named `AI Erase 1 of 3`
+through `3 of 3`, with only the first visible. Toggle layer visibility to compare
+and keep the one you prefer. They are worth comparing: on a test photo one
+variation invented a garbled bit of text on a background sign while the other two
+were clean. The three run concurrently, so all three take about as long as one
+(measured: 17 seconds).
+
+Set `erase_variations` in the `bedrock` section of `config.json` to change how
+many are generated (1-4). Removal is unambiguous, and
+describing it only invites the model to invent replacement content instead of
+removing.
+
+Requires Amazon Bedrock as the provider - it uses Stability's purpose-built
+object-erase model, which has no OpenAI equivalent.
+
+Two things it does differently from Inpainting, both of which matter for
+quality:
+
+- The context window is taken at **native resolution**, sized to roughly one
+  megapixel around the selection. Inpainting snaps to the OpenAI shapes, which
+  for a small selection means upscaling a tight crop: a 160px selection became a
+  288px crop blown up 3.56x, so 92% of what the model saw was interpolated.
+- The whole window is pasted back rather than masked to the selection, so the
+  blending the model already did across the mask edge is preserved instead of
+  being cut off at the selection rectangle.
+
+Tip: include a little of the object's shadow or contact points in the selection.
+A mask that stops exactly at the outline tends to leave a ghost behind.
 
 ### AI Image Generation
 

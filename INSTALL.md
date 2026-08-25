@@ -45,10 +45,11 @@ The installation process is simple:
 
 ## 📥 Step 1: Download the Plugin Files
 
-You need **exactly 2 files**:
+You need **exactly 3 files**:
 
 1. **`gimp-ai-plugin.py`** - The main plugin file
 2. **`coordinate_utils.py`** - Helper functions (required)
+3. **`bedrock_client.py`** - Amazon Bedrock support (required)
 
 ### Option A: Download Release Package with Automated Installer (Easiest!)
 
@@ -76,6 +77,7 @@ You need **exactly 2 files**:
 1. Go to the [GitHub repository](https://github.com/lukaso/gimp-ai)
 2. Click on `gimp-ai-plugin.py` → Click "Raw" → Save the file (Ctrl+S or Cmd+S)
 3. Go back and click on `coordinate_utils.py` → Click "Raw" → Save the file
+4. Do the same for `bedrock_client.py`
 
 > **Important**: Keep these two files together - the plugin won't work without both!
 
@@ -164,7 +166,8 @@ Your final structure should look like this:
 plug-ins/
 └── gimp-ai-plugin/          ← Create this folder
     ├── gimp-ai-plugin.py    ← Copy this file here
-    └── coordinate_utils.py  ← Copy this file here
+    ├── coordinate_utils.py  ← Copy this file here
+    └── bedrock_client.py    ← Copy this file here
 ```
 
 ### How to Create the Folder
@@ -205,8 +208,9 @@ Now copy **both files** you downloaded into the `gimp-ai-plugin` folder you just
 
 - ✅ `gimp-ai-plugin.py`
 - ✅ `coordinate_utils.py`
+- ✅ `bedrock_client.py`
 
-Both files must be in the same `gimp-ai-plugin` folder!
+All three files must be in the same `gimp-ai-plugin` folder!
 
 ---
 

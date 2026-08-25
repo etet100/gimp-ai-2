@@ -4,7 +4,7 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ## Project Overview
 
-**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (v0.8) supporting OpenAI's image generation models for inpainting, image generation, and layer compositing.
+**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (v0.8) supporting OpenAI's image generation models for inpainting, image generation, and layer compositing, plus Amazon Bedrock as an alternative inpainting provider.
 
 ### Key Features
 - **AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
@@ -31,6 +31,9 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 - **OpenAI Image API** (`https://api.openai.com/v1/images/...`)
   - Generations endpoint for creating images
   - Edits endpoint for inpainting
+- **Amazon Bedrock Runtime** (`https://bedrock-runtime.{region}.amazonaws.com/model/{id}/invoke`)
+  - Stability AI inpainting model; serves inpainting and layer composite
+  - SigV4-signed with the standard library (see `bedrock_client.py`)
 
 ## Architecture
 
@@ -38,7 +41,7 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 1. **`gimp-ai-plugin.py`** (Main plugin, ~4000 lines)
    - `GimpAIPlugin` class: Main plugin entry point
-   - Procedure registration (3 procedures: inpainting, generation, composite)
+   - Procedure registration (4 procedures: inpainting, erase object, generation, composite)
    - Configuration management (API key storage)
    - UI dialogs (GTK-based settings and progress)
    - OpenAI API communication
@@ -52,7 +55,18 @@ This file provides guidance to GitHub Copilot when working with code in this rep
    - Padding and scaling algorithms
    - See `ALGORITHMS.md` for detailed algorithm documentation
 
-3. **`install.py`** / **`install_simple.py`**
+3. **`bedrock_client.py`** (Bedrock transport, ~250 lines)
+   - **Pure functions with no GIMP dependencies** (unit testable, `python3 bedrock_client.py` self-checks)
+   - SigV4 signing with `hmac`/`hashlib` - no boto3, since installing packages
+     into GIMP's bundled Python is painful
+   - Credential resolution: plugin config -> environment -> `~/.aws`
+   - Adds the cross-region inference profile prefix (`us.`/`eu.`/`apac.`) that
+     Stability image models require
+   - Two gotchas the live API enforces: requests are signed against service
+     name `bedrock` (not `bedrock-runtime`), and the model id's colon must be
+     percent-encoded once in the URL and twice in the canonical request
+
+4. **`install.py`** / **`install_simple.py`**
    - Installation scripts for copying files to GIMP plugin directories
 
 ### Key Design Principles
@@ -90,6 +104,8 @@ class MyPlugin(Gimp.PlugIn):
 ```
 
 ### Configuration Management
+- `api_provider` selects the inpainting provider: `"openai"` or `"bedrock"`
+- Bedrock settings live under the `"bedrock"` key (region, model_id, api_key, profile)
 - API keys stored in `~/.config/gimp-ai-plugin/config.json`
 - Fallback locations: `~/.gimp-ai-config.json`, local `config.json`
 - Never commit real API keys to the repository
@@ -116,7 +132,10 @@ class MyPlugin(Gimp.PlugIn):
 ### Testing Guidelines
 
 - **Unit tests**: Pure functions in `coordinate_utils.py` should have unit tests
-- **Integration tests**: Not currently implemented (would require GIMP environment)
+- **Integration tests**: `tests/test_gimp_pipeline.py` runs inside GIMP headless:
+  `gimp -i --batch-interpreter=python-fu-eval -b "import runpy; runpy.run_path('$PWD/tests/test_gimp_pipeline.py')"`
+  Rebinding the plugin methods onto a plain object is required - instantiating
+  `GimpAIPlugin` outside the plug-in protocol aborts GIMP
 - **Manual testing**: Required for UI and GIMP integration
   - Test all three procedures: inpainting, generation, composite
   - Test with various image sizes and aspect ratios
@@ -143,6 +162,7 @@ python3 -m pytest tests/
 mkdir -p ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 cp gimp-ai-plugin.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 cp coordinate_utils.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
+cp bedrock_client.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 chmod +x ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
 ```
 
@@ -152,8 +172,9 @@ chmod +x ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
 - **Windows**: `%APPDATA%\GIMP\3.0\plug-ins\`
 
 ### Validation Steps
-1. **Syntax check**: `python3 -m py_compile gimp-ai-plugin.py coordinate_utils.py`
+1. **Syntax check**: `python3 -m py_compile gimp-ai-plugin.py coordinate_utils.py bedrock_client.py`
 2. **Import test**: `python3 -c "import coordinate_utils"`
+2b. **Bedrock self-check**: `python3 bedrock_client.py`
 3. **GIMP recognition**: Plugin appears in Filters → AI menu after restart
 
 ### No External Dependencies to Manage
@@ -223,8 +244,34 @@ Detailed algorithms documented in `ALGORITHMS.md`.
 3. Update `ALGORITHMS.md` if algorithm changes
 4. Test with various image sizes/aspect ratios
 
+**Never place layers with Gegl `buffer-source -> translate -> write-buffer`.**
+That chain writes zero pixels under GIMP 3.2 - verified with
+`tests/probe_placement.py`. Use `Gimp.Layer.new_from_drawable()` +
+`set_offsets()`, and call `add_alpha()` before `resize_to_image_size()` or the
+grown area is filled with opaque background instead of transparency.
+
+**Bedrock does not need the OpenAI shapes.** `get_optimal_openai_shape()` exists
+because OpenAI accepts only 1024x1024 / 1536x1024 / 1024x1536. Stability accepts
+any size from 64px per side up to 9.4MP, so Bedrock paths use
+`calculate_native_context()` instead: a ~1MP window at native resolution that
+never upscales. Do not exceed about a megapixel - Stability downsamples above
+that, measurably worse.
+
+**Masks are built from a duplicate of the image, not from buffer compositing.**
+`image.duplicate()` carries the selection with it, so the mask is filled at full
+image size and cropped to the extract region afterwards. Do not go back to
+compositing the selection channel into an extract-sized buffer: the channel sits
+at image coordinates and the buffer at (0,0), so the selection silently misses
+the mask entirely unless it happens to be in the top-left corner.
+
+**Mask conventions differ between providers:**
+- OpenAI: the area to inpaint is transparent
+- Bedrock/Stability: the area to inpaint is white, preserved areas are black
+- `_convert_mask_to_bedrock()` flattens the OpenAI mask onto white to convert,
+  which must run on the main thread because it uses GIMP image operations
+
 **Changing API integration:**
-1. Update in `_call_openai_api()` or related methods
+1. Update in `_call_openai_api()`, `_call_bedrock_edit()` or related methods
 2. Handle new error cases
 3. Update configuration if needed
 4. Test with real API calls

@@ -20,7 +20,8 @@ Common issues and solutions for the GIMP AI Plugin.
    plug-ins/
    └── gimp-ai-plugin/          ← Must be this exact folder name
        ├── gimp-ai-plugin.py    ← Required file #1
-       └── coordinate_utils.py  ← Required file #2
+       ├── coordinate_utils.py  ← Required file #2
+       └── bedrock_client.py    ← Required file #3
    ```
 
 2. **Check plugin directory location for your OS**:

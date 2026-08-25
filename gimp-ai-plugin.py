@@ -39,6 +39,14 @@ from coordinate_utils import (
     calculate_scale_from_shape,
 )
 
+# Amazon Bedrock support is optional - the plugin still works with OpenAI alone
+# if this module is missing (e.g. an older install that only copied two files).
+try:
+    import bedrock_client
+except ImportError as e:
+    bedrock_client = None
+    print(f"DEBUG: Bedrock support unavailable: {e}")
+
 
 class GimpAIPlugin(Gimp.PlugIn):
     """Simplified AI Plugin"""
@@ -117,6 +125,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             with open(config_path, "w") as f:
                 json.dump(self.config, f, indent=4)
+            self._restrict_config_permissions(config_path)
             print(f"DEBUG: Saved config to GIMP preferences: {config_path}")
             return True
         except Exception as e:
@@ -128,11 +137,20 @@ class GimpAIPlugin(Gimp.PlugIn):
                 os.makedirs(config_dir, exist_ok=True)
                 with open(config_path, "w") as f:
                     json.dump(self.config, f, indent=4)
+                self._restrict_config_permissions(config_path)
                 print(f"DEBUG: Saved config to fallback location: {config_path}")
                 return True
             except Exception as e2:
                 print(f"DEBUG: All config save attempts failed: {e2}")
                 return False
+
+    def _restrict_config_permissions(self, config_path):
+        """The config holds API keys and AWS secrets, so keep it owner-only"""
+        try:
+            os.chmod(config_path, 0o600)
+        except Exception as e:
+            # Windows and some filesystems do not support this
+            print(f"DEBUG: Could not restrict config permissions: {e}")
 
     def _make_url_request(self, req_or_url, timeout=60, headers=None):
         """
@@ -228,6 +246,69 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         # No API key found
         return None
+
+    def _get_provider(self):
+        """Which API provider handles inpainting: 'openai' or 'bedrock'"""
+        provider = self.config.get("api_provider", "openai")
+        if provider == "bedrock" and bedrock_client is None:
+            print("DEBUG: Bedrock configured but module missing, falling back to OpenAI")
+            return "openai"
+        return provider
+
+    def _credentials_ready(self, provider="openai"):
+        """
+        Is the given provider usable? Every credential gate routes through here,
+        so an OpenAI key is never demanded for a Bedrock operation.
+        """
+        if provider == "bedrock":
+            try:
+                creds = bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
+                print(
+                    f"DEBUG: Bedrock credentials ready via {creds['source']} "
+                    f"(region {creds['region']}, model {creds['model_id']})"
+                )
+                return True
+            except bedrock_client.BedrockError as e:
+                print(f"DEBUG: Bedrock credentials not ready: {e}")
+                self._log_bedrock_environment()
+                return False
+        return bool(self._get_api_key())
+
+    def _log_bedrock_environment(self):
+        """Print what the plugin can actually see, for diagnosing credential problems"""
+        print("DEBUG: --- Bedrock environment ---")
+        for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+        ):
+            value = os.environ.get(name)
+            if not value:
+                print(f"DEBUG:   {name}: not set")
+            elif "SECRET" in name or "TOKEN" in name:
+                print(f"DEBUG:   {name}: set ({len(value)} chars)")
+            else:
+                print(f"DEBUG:   {name}: {value}")
+
+        aws_dir = os.path.expanduser("~/.aws")
+        creds_file = os.path.join(aws_dir, "credentials")
+        if not os.path.exists(aws_dir):
+            print(f"DEBUG:   {aws_dir}: not present")
+        elif not os.access(creds_file, os.R_OK):
+            print(
+                f"DEBUG:   {creds_file}: exists but unreadable - a sandboxed GIMP "
+                "(snap/flatpak) cannot read hidden directories outside ~/.config/GIMP"
+            )
+        else:
+            print(f"DEBUG:   {creds_file}: readable")
+
+        config_keys = sorted(self.config.get("bedrock", {}).keys())
+        print(f"DEBUG:   config 'bedrock' keys: {config_keys or 'none'}")
+        print("DEBUG: ---------------------------")
 
     def _get_processing_mode(self, dialog_mode=None):
         """Determine processing mode based on dialog selection or fallback to config"""
@@ -343,11 +424,16 @@ class GimpAIPlugin(Gimp.PlugIn):
         content_area.set_margin_bottom(margin)
         return content_area
 
-    def _add_api_warning_bar(self, content_area, dialog):
+    def _add_api_warning_bar(self, content_area, dialog, provider="openai"):
         """Add API key warning info bar if needed, returns (warning_bar, ok_button_needs_config)"""
-        api_key = self._get_api_key()
-        if api_key:
+        if self._credentials_ready(provider):
             return None, False
+
+        warning_text = (
+            "⚠️ AWS credentials for Bedrock not configured"
+            if provider == "bedrock"
+            else "⚠️ OpenAI API key not configured"
+        )
 
         # Create warning info bar
         api_warning_bar = Gtk.InfoBar()
@@ -356,7 +442,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         # Warning message
         warning_label = Gtk.Label()
-        warning_label.set_markup("⚠️ OpenAI API key not configured")
+        warning_label.set_markup(warning_text)
         warning_label.set_halign(Gtk.Align.START)
 
         # Configure button - connect to main dialog response
@@ -406,7 +492,12 @@ class GimpAIPlugin(Gimp.PlugIn):
         return self._cancel_requested
 
     def _show_prompt_dialog(
-        self, title="AI Prompt", default_text="", show_mode_selection=True, image=None
+        self,
+        title="AI Prompt",
+        default_text="",
+        show_mode_selection=True,
+        image=None,
+        provider="openai",
     ):
         """Show a GIMP UI dialog to get user input for AI prompt"""
         # Use last prompt as default if available, otherwise use provided default
@@ -440,7 +531,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Add API warning bar using helper
             api_warning_bar, needs_config = self._add_api_warning_bar(
-                content_area, dialog
+                content_area, dialog, provider
             )
             if needs_config:
                 # Disable OK button when no API key
@@ -573,23 +664,26 @@ class GimpAIPlugin(Gimp.PlugIn):
                 print(f"DEBUG: Dialog response: {response}")
 
                 if response == Gtk.ResponseType.OK:
-                    # First check if API key is configured (for "Configure & Continue" button)
-                    current_api_key = self._get_api_key()
-                    if not current_api_key:
-                        print("DEBUG: OK clicked but no API key, opening settings")
+                    # First check credentials are configured (for "Configure & Continue" button)
+                    if not self._credentials_ready(provider):
+                        print(
+                            f"DEBUG: OK clicked but {provider} not configured, opening settings"
+                        )
                         self._show_settings_dialog(dialog)
 
-                        # Re-check API key after settings dialog
-                        current_api_key = self._get_api_key()
-                        if current_api_key:
+                        # The settings dialog can change the provider itself
+                        provider = self._get_provider()
+
+                        # Re-check credentials after settings dialog
+                        if self._credentials_ready(provider):
                             # API key now configured - update UI
                             if api_warning_bar:
                                 api_warning_bar.hide()
                             ok_button.set_sensitive(True)
                             ok_button.set_label("OK")
-                            print("DEBUG: API key configured, enabled OK button")
+                            print(f"DEBUG: {provider} configured, enabled OK button")
                         else:
-                            print("DEBUG: API key still not configured")
+                            print(f"DEBUG: {provider} still not configured")
                             continue  # Keep dialog open
 
                     # Now validate the prompt
@@ -672,21 +766,22 @@ class GimpAIPlugin(Gimp.PlugIn):
                     print("DEBUG: Configure Now button clicked")
                     self._show_settings_dialog(dialog)
 
-                    # Re-check API key after settings dialog
-                    api_key = self._get_api_key()
-                    if api_key:
-                        # API key now configured - update UI
+                    # Re-check credentials after settings dialog
+                    provider = self._get_provider()
+                    if self._credentials_ready(provider):
+                        # Credentials now configured - update UI
                         if api_warning_bar:
                             api_warning_bar.hide()
                         ok_button.set_sensitive(True)
                         ok_button.set_label("OK")
-                        print("DEBUG: API key configured, enabled OK button")
+                        print(f"DEBUG: {provider} configured, enabled OK button")
                     else:
-                        print("DEBUG: API key still not configured")
+                        print(f"DEBUG: {provider} still not configured")
                     # Continue loop to keep main dialog open
                 elif response == Gtk.ResponseType.HELP:  # Settings button
                     print("DEBUG: Settings button clicked")
                     self._show_settings_dialog(dialog)
+                    provider = self._get_provider()
                     # Continue loop to keep main dialog open
                 else:
                     print("DEBUG: Dialog cancelled, destroying...")
@@ -698,7 +793,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             # Fallback to default prompt if dialog fails
             return default_text if default_text else "fill this area naturally"
 
-    def _show_composite_dialog(self, image):
+    def _show_composite_dialog(self, image, provider="openai"):
         """Show dedicated dialog for Layer Composite with visible layers info"""
         try:
             print("DEBUG: Creating Layer Composite dialog")
@@ -757,7 +852,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Add API warning bar using helper
             api_warning_bar, needs_config = self._add_api_warning_bar(
-                content_area, dialog
+                content_area, dialog, provider
             )
             if needs_config:
                 # Disable OK button when no API key
@@ -938,31 +1033,31 @@ class GimpAIPlugin(Gimp.PlugIn):
                     print("DEBUG: Settings button clicked")
                     # Show settings dialog
                     self._show_settings_dialog(dialog)
-                    # Check if API key was configured
-                    api_key = self._get_api_key()
-                    if api_key:
-                        print("DEBUG: API key configured, enabled OK button")
+                    # Check if credentials were configured
+                    provider = self._get_provider()
+                    if self._credentials_ready(provider):
+                        print(f"DEBUG: {provider} configured, enabled OK button")
                         ok_button.set_sensitive(True)
                         ok_button.set_label("Composite Layers")
                         if api_warning_bar:
                             api_warning_bar.hide()
                     else:
-                        print("DEBUG: API key still not configured")
+                        print(f"DEBUG: {provider} still not configured")
 
                 elif response == Gtk.ResponseType.APPLY:
                     print("DEBUG: Configure Now button clicked")
                     # Show settings dialog when "Configure Now" is clicked
                     self._show_settings_dialog(dialog)
-                    # Check if API key was configured
-                    api_key = self._get_api_key()
-                    if api_key:
-                        print("DEBUG: API key configured, enabled OK button")
+                    # Check if credentials were configured
+                    provider = self._get_provider()
+                    if self._credentials_ready(provider):
+                        print(f"DEBUG: {provider} configured, enabled OK button")
                         ok_button.set_sensitive(True)
                         ok_button.set_label("Composite Layers")
                         if api_warning_bar:
                             api_warning_bar.hide()
                     else:
-                        print("DEBUG: API key still not configured")
+                        print(f"DEBUG: {provider} still not configured")
 
                 else:
                     dialog.destroy()
@@ -981,8 +1076,9 @@ class GimpAIPlugin(Gimp.PlugIn):
                 flags=Gtk.DialogFlags.MODAL,
             )
 
-            # Set up dialog properties
-            dialog.set_default_size(500, 400)
+            # Two columns keep the dialog short enough that the buttons stay on
+            # screen at 1080p; the scrolled window covers smaller displays.
+            dialog.set_default_size(900, 560)
             dialog.set_resizable(True)
 
             # Add buttons
@@ -992,12 +1088,58 @@ class GimpAIPlugin(Gimp.PlugIn):
             save_button.grab_default()
 
             # Add content
-            content_area = dialog.get_content_area()
-            content_area.set_spacing(15)
-            content_area.set_margin_start(20)
-            content_area.set_margin_end(20)
-            content_area.set_margin_top(20)
-            content_area.set_margin_bottom(20)
+            dialog_content = dialog.get_content_area()
+
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            dialog_content.pack_start(scroller, True, True, 0)
+
+            columns = Gtk.HBox(spacing=15)
+            columns.set_margin_start(20)
+            columns.set_margin_end(20)
+            columns.set_margin_top(20)
+            columns.set_margin_bottom(20)
+            scroller.add(columns)
+
+            content_area = Gtk.VBox(spacing=15)
+            right_column = Gtk.VBox(spacing=15)
+            columns.pack_start(content_area, True, True, 0)
+            columns.pack_start(right_column, True, True, 0)
+
+            # Provider selection
+            provider_frame = Gtk.Frame(label="Inpainting Provider")
+            provider_box = Gtk.VBox(spacing=10)
+            provider_box.set_margin_start(10)
+            provider_box.set_margin_end(10)
+            provider_box.set_margin_top(10)
+            provider_box.set_margin_bottom(10)
+
+            provider_combo = Gtk.ComboBoxText()
+            provider_ids = ["openai", "bedrock"]
+            provider_combo.append_text("OpenAI (GPT-Image-1)")
+            provider_combo.append_text("Amazon Bedrock (Stability inpainting)")
+            current_provider = self.config.get("api_provider", "openai")
+            provider_combo.set_active(
+                provider_ids.index(current_provider)
+                if current_provider in provider_ids
+                else 0
+            )
+            provider_box.pack_start(provider_combo, False, False, 0)
+
+            provider_info = Gtk.Label()
+            provider_info.set_text(
+                "Image generation and layer composite always use OpenAI"
+            )
+            provider_info.set_halign(Gtk.Align.START)
+            provider_info.get_style_context().add_class("dim-label")
+            provider_box.pack_start(provider_info, False, False, 0)
+
+            if bedrock_client is None:
+                provider_combo.set_sensitive(False)
+                provider_info.set_text("bedrock_client.py is missing - reinstall the plugin")
+
+            provider_frame.add(provider_box)
+            content_area.pack_start(provider_frame, False, False, 0)
 
             # API Key section
             api_frame = Gtk.Frame(label="OpenAI API Configuration")
@@ -1029,6 +1171,92 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             api_frame.add(api_box)
             content_area.pack_start(api_frame, False, False, 0)
+
+            # Bedrock section
+            bedrock_config = self.config.get("bedrock", {})
+            bedrock_frame = Gtk.Frame(label="Amazon Bedrock Configuration")
+            bedrock_box = Gtk.VBox(spacing=10)
+            bedrock_box.set_margin_start(10)
+            bedrock_box.set_margin_end(10)
+            bedrock_box.set_margin_top(10)
+            bedrock_box.set_margin_bottom(10)
+
+            # A grid keeps each setting on one row instead of two
+            bedrock_grid = Gtk.Grid()
+            bedrock_grid.set_row_spacing(6)
+            bedrock_grid.set_column_spacing(10)
+
+            def add_bedrock_row(row, text, entry):
+                label = Gtk.Label(label=text)
+                label.set_halign(Gtk.Align.START)
+                entry.set_hexpand(True)
+                bedrock_grid.attach(label, 0, row, 1, 1)
+                bedrock_grid.attach(entry, 1, row, 1, 1)
+
+            region_entry = Gtk.Entry()
+            region_entry.set_placeholder_text(bedrock_client.DEFAULT_REGION if bedrock_client else "us-east-1")
+            region_entry.set_text(bedrock_config.get("region", ""))
+            add_bedrock_row(0, "AWS region:", region_entry)
+
+            model_entry = Gtk.Entry()
+            model_entry.set_placeholder_text(
+                bedrock_client.DEFAULT_MODEL_ID if bedrock_client else "stability.stable-image-inpaint-v1:0"
+            )
+            model_entry.set_text(bedrock_config.get("model_id", ""))
+            add_bedrock_row(1, "Model ID:", model_entry)
+
+            access_key_entry = Gtk.Entry()
+            access_key_entry.set_placeholder_text("AKIA... (blank to use environment)")
+            access_key_entry.set_text(bedrock_config.get("access_key_id", ""))
+            add_bedrock_row(2, "Access key ID:", access_key_entry)
+
+            secret_key_entry = Gtk.Entry()
+            secret_key_entry.set_visibility(False)
+            secret_key_entry.set_placeholder_text(
+                "stored - type to replace"
+                if bedrock_config.get("secret_access_key")
+                else "blank to use environment"
+            )
+            add_bedrock_row(3, "Secret access key:", secret_key_entry)
+
+            bedrock_key_entry = Gtk.Entry()
+            bedrock_key_entry.set_visibility(False)
+            bedrock_key_entry.set_placeholder_text(
+                "stored - type to replace"
+                if bedrock_config.get("api_key")
+                else "optional, instead of the keys above"
+            )
+            add_bedrock_row(4, "Bedrock API key:", bedrock_key_entry)
+
+            bedrock_box.pack_start(bedrock_grid, False, False, 0)
+
+            clear_creds_button = Gtk.Button(label="Clear Stored AWS Credentials")
+            clear_creds_button.connect(
+                "clicked",
+                lambda _b: self._on_clear_bedrock_credentials(
+                    access_key_entry, secret_key_entry, bedrock_key_entry
+                ),
+            )
+            bedrock_box.pack_start(clear_creds_button, False, False, 0)
+
+            bedrock_info = Gtk.Label()
+            bedrock_info.set_text(
+                "Leave the credential fields blank to read AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY from the environment, or ~/.aws. A sandboxed "
+                "GIMP (snap, flatpak) cannot read ~/.aws at all, so fill these in if "
+                "you launch GIMP from the desktop. Secrets are stored in plain text "
+                "in config.json (mode 600)."
+            )
+            # Wrap rather than force the whole dialog wider
+            bedrock_info.set_line_wrap(True)
+            bedrock_info.set_max_width_chars(46)
+            bedrock_info.set_xalign(0.0)
+            bedrock_info.set_halign(Gtk.Align.START)
+            bedrock_info.get_style_context().add_class("dim-label")
+            bedrock_box.pack_start(bedrock_info, False, False, 0)
+
+            bedrock_frame.add(bedrock_box)
+            right_column.pack_start(bedrock_frame, False, False, 0)
 
             # Prompt History section
             history_frame = Gtk.Frame(label="Prompt History")
@@ -1079,8 +1307,9 @@ class GimpAIPlugin(Gimp.PlugIn):
             debug_frame.add(debug_box)
             content_area.pack_start(debug_frame, False, False, 0)
 
-            # Show all widgets
-            content_area.show_all()
+            # Show all widgets - must start from the dialog's own content area,
+            # since content_area is only the left column here
+            dialog_content.show_all()
 
             # Run dialog
             response = dialog.run()
@@ -1093,6 +1322,30 @@ class GimpAIPlugin(Gimp.PlugIn):
                     self.config["openai"]["api_key"] = new_key
                     print("DEBUG: API key updated")
 
+                # Save provider selection
+                active = provider_combo.get_active()
+                if active >= 0:
+                    self.config["api_provider"] = provider_ids[active]
+                    print(f"DEBUG: Provider set to {provider_ids[active]}")
+
+                # Save Bedrock settings (blank entries clear the override)
+                bedrock = self.config.setdefault("bedrock", {})
+                bedrock["region"] = region_entry.get_text().strip()
+                bedrock["model_id"] = model_entry.get_text().strip()
+                bedrock["access_key_id"] = access_key_entry.get_text().strip()
+
+                # Secrets are write-only: a blank field keeps what is stored,
+                # so they are cleared through the Clear button instead.
+                new_secret = secret_key_entry.get_text().strip()
+                if new_secret:
+                    bedrock["secret_access_key"] = new_secret
+                    print("DEBUG: Bedrock secret access key updated")
+
+                new_bedrock_key = bedrock_key_entry.get_text().strip()
+                if new_bedrock_key:
+                    bedrock["api_key"] = new_bedrock_key
+                    print("DEBUG: Bedrock API key updated")
+
                 # Save debug mode setting
                 debug_mode = debug_checkbox.get_active()
                 self.config["debug_mode"] = debug_mode
@@ -1103,6 +1356,19 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         except Exception as e:
             print(f"DEBUG: Settings dialog error: {e}")
+
+    def _on_clear_bedrock_credentials(self, access_entry, secret_entry, api_key_entry):
+        """Remove stored AWS credentials from the config and clear the fields"""
+        bedrock = self.config.setdefault("bedrock", {})
+        for key in ("access_key_id", "secret_access_key", "api_key", "session_token"):
+            bedrock.pop(key, None)
+        self._save_config()
+
+        for entry in (access_entry, secret_entry, api_key_entry):
+            entry.set_text("")
+        secret_entry.set_placeholder_text("blank to use environment")
+        api_key_entry.set_placeholder_text("optional, instead of the keys above")
+        print("DEBUG: Cleared stored Bedrock credentials")
 
     def _on_clear_history_clicked(self, button):
         """Handle clear history button click"""
@@ -1878,6 +2144,47 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"DEBUG: Layer preparation failed: {e}")
             return False, f"Layer preparation failed: {str(e)}", None, None
 
+    def _flatten_layers_for_bedrock(self, image, selected_layers, context_info):
+        """
+        Flatten the selected layers into a single image for Bedrock.
+
+        Bedrock's inpainting model takes one image plus a mask, not the array of
+        separate layers gpt-image-1 accepts, so the layers are composited here
+        (by GIMP, which is what layers are for) and the model only ever sees the
+        combined pixels. Returns the same (success, message, base64) tuple as
+        _extract_context_region, whose scaling and padding it reuses.
+        """
+        temp_image = None
+        try:
+            temp_image = Gimp.Image.new(
+                image.get_width(), image.get_height(), Gimp.ImageBaseType.RGB
+            )
+
+            # selected_layers arrives base-first, and each copy is inserted at
+            # the top of the stack, so the last one ends up on top.
+            for layer in selected_layers:
+                layer_copy = Gimp.Layer.new_from_drawable(layer, temp_image)
+                layer_copy.set_name(layer.get_name())
+                temp_image.insert_layer(layer_copy, None, 0)
+                layer_copy.set_offsets(*layer.get_offsets()[1:])
+
+            if len(temp_image.get_layers()) > 1:
+                temp_image.flatten()
+
+            print(
+                f"DEBUG: Flattened {len(selected_layers)} layers into a single "
+                f"{temp_image.get_width()}x{temp_image.get_height()} image for Bedrock"
+            )
+
+            return self._extract_context_region(temp_image, context_info)
+
+        except Exception as e:
+            print(f"DEBUG: Layer flattening failed: {e}")
+            return False, f"Layer flattening failed: {str(e)}", None
+        finally:
+            if temp_image:
+                temp_image.delete()
+
     def _export_layer_to_png(self, temp_image):
         """Helper function to export a GIMP image to PNG bytes"""
         try:
@@ -1951,91 +2258,90 @@ class GimpAIPlugin(Gimp.PlugIn):
                     f"DEBUG: Creating mask at extract region size {mask_base_width}x{mask_base_height}, then scaling like image"
                 )
 
-            # Use the EXISTING working mask creation logic, but at correct base size
-            mask_image = Gimp.Image.new(
-                mask_base_width, mask_base_height, Gimp.ImageBaseType.RGB
-            )
+            from gi.repository import Gegl
+
+            # Build the mask with plain GIMP fills. Duplicating the image carries
+            # the selection along with it, so the mask starts at full image size
+            # and is cropped to the extract region afterwards. Compositing the
+            # selection channel through a Gegl graph instead put the selection at
+            # the image origin rather than the extract region, which produced an
+            # all-black "inpaint nothing" mask whenever the selection was not in
+            # the top-left corner.
+            full_width = image.get_width()
+            full_height = image.get_height()
+
+            Gimp.context_push()
+            mask_image = image.duplicate()
             mask_layer = Gimp.Layer.new(
                 mask_image,
                 "selection_mask",
-                mask_base_width,
-                mask_base_height,
+                full_width,
+                full_height,
                 Gimp.ImageType.RGBA_IMAGE,
                 100.0,
                 Gimp.LayerMode.NORMAL,
             )
             mask_image.insert_layer(mask_layer, None, 0)
 
-            # Fill with black (preserve areas)
-            from gi.repository import Gegl
+            try:
+                # Everything outside the selection is black (preserve)
+                duplicated_selection = Gimp.Selection.save(mask_image)
+                Gimp.Selection.none(mask_image)
+                Gimp.context_set_foreground(Gegl.Color.new("black"))
+                mask_layer.edit_fill(Gimp.FillType.FOREGROUND)
 
-            black_color = Gegl.Color.new("black")
-            Gimp.context_set_foreground(black_color)
-            mask_layer.edit_fill(Gimp.FillType.FOREGROUND)
-
-            # Copy selection shape exactly as the working code does
-            selection_buffer = selection_channel.get_buffer()
-            mask_shadow_buffer = mask_layer.get_shadow_buffer()
-
-            # Use the WORKING Gegl approach from the existing code
-            graph = Gegl.Node()
-
-            mask_source = graph.create_child("gegl:buffer-source")
-            mask_source.set_property("buffer", mask_layer.get_buffer())
-
-            selection_source = graph.create_child("gegl:buffer-source")
-            selection_source.set_property("buffer", selection_buffer)
-
-            composite = graph.create_child("gegl:over")
-            output = graph.create_child("gegl:write-buffer")
-            output.set_property("buffer", mask_shadow_buffer)
-
-            mask_source.link(composite)
-            selection_source.connect_to("output", composite, "aux")
-            composite.link(output)
-            output.process()
-
-            mask_shadow_buffer.flush()
-            mask_layer.merge_shadow(True)
-            mask_layer.update(0, 0, mask_base_width, mask_base_height)
-
-            # Make white areas transparent (WORKING code)
-            transparency_graph = Gegl.Node()
-            layer_buffer = mask_layer.get_buffer()
-            shadow_buffer = mask_layer.get_shadow_buffer()
-
-            buffer_source = transparency_graph.create_child("gegl:buffer-source")
-            buffer_source.set_property("buffer", layer_buffer)
-
-            color_to_alpha = transparency_graph.create_child("gegl:color-to-alpha")
-            white_color = Gegl.Color.new("white")
-            color_to_alpha.set_property("color", white_color)
-
-            buffer_write = transparency_graph.create_child("gegl:write-buffer")
-            buffer_write.set_property("buffer", shadow_buffer)
-
-            buffer_source.link(color_to_alpha)
-            color_to_alpha.link(buffer_write)
-            buffer_write.process()
-
-            shadow_buffer.flush()
-            mask_layer.merge_shadow(True)
-            mask_layer.update(0, 0, mask_base_width, mask_base_height)
-
-            print(
-                f"DEBUG: Created mask at original size with transparent selection areas"
-            )
-
-            # NOW scale using SAME operations as image
-            if scale_factor != 1.0:
-                mask_image.scale(scaled_w, scaled_h)
-                print(f"DEBUG: Scaled mask to {scaled_w}x{scaled_h}")
-
-            if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
-                mask_image.resize(target_width, target_height, pad_left, pad_top)
-                print(
-                    f"DEBUG: Added padding to mask to reach {target_width}x{target_height}"
+                # The selection itself becomes transparent (inpaint), which is
+                # the convention the OpenAI edits endpoint expects
+                mask_image.select_item(
+                    Gimp.ChannelOps.REPLACE, duplicated_selection
                 )
+                mask_layer.edit_clear()
+                Gimp.Selection.none(mask_image)
+
+                # Discard the duplicated image content, keep only the mask
+                for other_layer in mask_image.get_layers():
+                    if other_layer != mask_layer:
+                        mask_image.remove_layer(other_layer)
+
+                if (mask_base_width, mask_base_height) != (full_width, full_height):
+                    extract_x, extract_y = context_info["extract_region"][:2]
+                    mask_image.crop(
+                        mask_base_width, mask_base_height, extract_x, extract_y
+                    )
+                    print(
+                        f"DEBUG: Cropped mask to extract region {mask_base_width}x"
+                        f"{mask_base_height} at ({extract_x},{extract_y})"
+                    )
+
+                # NOW scale using SAME operations as image
+                if scale_factor != 1.0:
+                    mask_image.scale(scaled_w, scaled_h)
+                    print(f"DEBUG: Scaled mask to {scaled_w}x{scaled_h}")
+
+                if pad_left > 0 or pad_top > 0 or pad_right > 0 or pad_bottom > 0:
+                    mask_image.resize(target_width, target_height, pad_left, pad_top)
+                    mask_layer = mask_image.get_layers()[0]
+                    mask_layer.resize_to_image_size()
+
+                    # Padding arrives transparent, which would read as "inpaint
+                    # this". Paint just the padding border black so only the real
+                    # selection stays transparent.
+                    mask_image.select_rectangle(
+                        Gimp.ChannelOps.REPLACE, 0, 0, target_width, target_height
+                    )
+                    mask_image.select_rectangle(
+                        Gimp.ChannelOps.SUBTRACT, pad_left, pad_top, scaled_w, scaled_h
+                    )
+                    Gimp.context_set_foreground(Gegl.Color.new("black"))
+                    mask_layer.edit_fill(Gimp.FillType.FOREGROUND)
+                    Gimp.Selection.none(mask_image)
+                    print(
+                        f"DEBUG: Added padding to mask to reach {target_width}x{target_height}"
+                    )
+            finally:
+                Gimp.context_pop()
+
+            print("DEBUG: Mask built - selection transparent, everything else black")
 
             # Export (same as working code)
             import tempfile
@@ -3064,6 +3370,318 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"DEBUG: GPT-Image-1 API call failed: {e}")
             return False, f"GPT-Image-1 API call failed: {str(e)}", None
 
+    def _convert_mask_to_bedrock(self, mask_data):
+        """
+        Convert an OpenAI-convention mask to the Bedrock/Stability convention.
+
+        OpenAI marks the area to inpaint with transparency; Stability marks it
+        with white pixels (black = preserve). Flattening the mask onto a white
+        background converts one to the other, and keeps the feathered edges as
+        greyscale values, which Stability reads as partial inpaint strength.
+
+        Must run on the main thread - it uses GIMP image operations.
+        """
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(mask_data)
+
+        mask_image = None
+        # Push a context so setting the background colour does not clobber the
+        # user's own background colour.
+        Gimp.context_push()
+        try:
+            mask_image = Gimp.file_load(
+                run_mode=Gimp.RunMode.NONINTERACTIVE,
+                file=Gio.File.new_for_path(temp_path),
+            )
+            if not mask_image:
+                raise Exception("Failed to load mask for conversion")
+
+            # Flatten fills transparent pixels with the background colour.
+            Gimp.context_set_background(Gegl.Color.new("white"))
+            mask_image.flatten()
+
+            converted = self._export_layer_to_png(mask_image)
+            if not converted:
+                raise Exception("Failed to export converted mask")
+
+            if self._is_debug_mode():
+                debug_path = os.path.join(
+                    tempfile.gettempdir(), f"bedrock_mask_{len(converted)}_bytes.png"
+                )
+                try:
+                    with open(debug_path, "wb") as debug_file:
+                        debug_file.write(converted)
+                    print(f"DEBUG: Saved Bedrock mask to {debug_path}")
+                except Exception as e:
+                    print(f"DEBUG: Could not save debug file: {e}")
+
+            print(f"DEBUG: Converted mask to Bedrock convention: {len(converted)} bytes")
+            return converted
+
+        finally:
+            Gimp.context_pop()
+            if mask_image:
+                mask_image.delete()
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _call_bedrock_edit(self, image_data, mask_data, prompt, progress_label=None):
+        """
+        Call Amazon Bedrock (Stability inpainting) and return an OpenAI-shaped response.
+
+        Returns the same {"data": [{"b64_json": ...}]} structure the OpenAI path
+        returns, so the compositing pipeline needs no provider-specific handling.
+        """
+        try:
+            if not prompt or not prompt.strip():
+                return False, "Error: Empty prompt provided", None
+            if not image_data:
+                return False, "Error: No image data provided", None
+            if not mask_data:
+                return False, "Error: No mask data provided", None
+            if isinstance(image_data, list):
+                return (
+                    False,
+                    "Error: Bedrock inpainting does not support multiple images",
+                    None,
+                )
+
+            bedrock_config = self.config.get("bedrock", {})
+            creds = bedrock_client.resolve_credentials(bedrock_config)
+            print(
+                f"DEBUG: Calling Bedrock model {creds['model_id']} in {creds['region']}"
+            )
+
+            # The image arrives base64-encoded, the mask as raw PNG bytes.
+            image_b64 = (
+                image_data if isinstance(image_data, str)
+                else base64.b64encode(image_data).decode("utf-8")
+            )
+            mask_b64 = base64.b64encode(mask_data).decode("utf-8")
+
+            body = bedrock_client.build_inpaint_body(
+                image_b64,
+                mask_b64,
+                prompt,
+                negative_prompt=bedrock_config.get("negative_prompt", ""),
+                seed=bedrock_config.get("seed", 0) if seed is None else seed,
+                grow_mask=bedrock_config.get("grow_mask", 5),
+            )
+            url, headers = bedrock_client.build_invoke_request(creds, body)
+            req = urllib.request.Request(
+                url, data=body, headers=headers, method="POST"
+            )
+
+            print("DEBUG: Sending Bedrock InvokeModel request...")
+            with self._make_url_request(req, timeout=180) as response:
+                if progress_label:
+                    self._update_progress(
+                        progress_label, "Processing AI response...", 0.7
+                    )
+                else:
+                    Gimp.progress_set_text("Processing AI response...")
+                    Gimp.progress_update(0.7)
+
+                response_json = json.loads(response.read().decode("utf-8"))
+
+            images = response_json.get("images") or []
+            if not images:
+                reasons = response_json.get("finish_reasons")
+                return False, f"Bedrock returned no image (finish: {reasons})", None
+
+            # Stability reports content filtering through finish_reasons.
+            finish_reasons = response_json.get("finish_reasons") or [None]
+            if finish_reasons[0]:
+                return (
+                    False,
+                    f"Bedrock refused the request: {finish_reasons[0]}",
+                    None,
+                )
+
+            print(f"DEBUG: Bedrock returned image, seed {response_json.get('seeds')}")
+            return (
+                True,
+                "Bedrock API call successful",
+                {"data": [{"b64_json": images[0]}]},
+            )
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            print(f"DEBUG: Bedrock HTTP error: {e.code} - {error_body}")
+            return False, f"Bedrock API error {e.code}: {error_body[:300]}", None
+        except Exception as e:
+            print(f"DEBUG: Bedrock API call failed: {e}")
+            return False, f"Bedrock API call failed: {str(e)}", None
+
+    def _calculate_native_context_extraction(self, image):
+        """
+        Context window for Bedrock at native resolution.
+
+        The OpenAI-shaped path snaps to 1024x1024 / 1536x1024 / 1024x1536, which
+        for a small selection means upscaling a tight crop - a 160px selection
+        became a 288px crop blown up 3.56x, so 92% of what the model saw was
+        interpolated. Bedrock accepts arbitrary sizes, so the window is taken at
+        native resolution instead and only ever scaled down.
+        """
+        from coordinate_utils import calculate_native_context
+
+        bounds = Gimp.Selection.bounds(image)
+        sel_x1, sel_y1, sel_x2, sel_y2 = bounds[2], bounds[3], bounds[4], bounds[5]
+
+        native = calculate_native_context(
+            image.get_width(), image.get_height(), (sel_x1, sel_y1, sel_x2, sel_y2)
+        )
+        x, y, width, height = native["extract_region"]
+        print(
+            f"DEBUG: Native context window ({x},{y}) {width}x{height}, "
+            f"scale {native['padding_info']['scale_factor']:.3f} "
+            f"(selection {sel_x2 - sel_x1}x{sel_y2 - sel_y1})"
+        )
+
+        return {
+            "mode": "focused",
+            "selection_bounds": (sel_x1, sel_y1, sel_x2, sel_y2),
+            "extract_region": native["extract_region"],
+            "target_shape": native["target_shape"],
+            "target_size": max(native["target_shape"]),
+            "needs_padding": False,
+            "padding_info": native["padding_info"],
+            "has_selection": True,
+        }
+
+    def _call_bedrock_erase(self, image_data, mask_data, progress_label=None, seed=None):
+        """
+        Call Bedrock's object-erase model. Same response shape as the others.
+
+        There is no prompt: the model fills the masked region from surrounding
+        context. Prompted inpainting invents new content instead of removing.
+        """
+        try:
+            if not image_data or not mask_data:
+                return False, "Error: Missing image or mask data", None
+
+            bedrock_config = self.config.get("bedrock", {})
+            creds = bedrock_client.erase_credentials(bedrock_config)
+            print(f"DEBUG: Calling Bedrock erase model {creds['model_id']}")
+
+            image_b64 = (
+                image_data if isinstance(image_data, str)
+                else base64.b64encode(image_data).decode("utf-8")
+            )
+            body = bedrock_client.build_erase_body(
+                image_b64,
+                base64.b64encode(mask_data).decode("utf-8"),
+                seed=bedrock_config.get("seed", 0) if seed is None else seed,
+                grow_mask=bedrock_config.get("grow_mask", 5),
+            )
+            url, headers = bedrock_client.build_invoke_request(creds, body)
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+            with self._make_url_request(req, timeout=180) as response:
+                if progress_label:
+                    self._update_progress(progress_label, "Processing result...", 0.7)
+                response_json = json.loads(response.read().decode("utf-8"))
+
+            images = response_json.get("images") or []
+            if not images:
+                return False, "Bedrock returned no image", None
+
+            finish_reasons = response_json.get("finish_reasons") or [None]
+            if finish_reasons[0]:
+                return False, f"Bedrock refused the request: {finish_reasons[0]}", None
+
+            return True, "Erase successful", {"data": [{"b64_json": images[0]}]}
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            print(f"DEBUG: Bedrock erase HTTP error: {e.code} - {error_body}")
+            return False, f"Bedrock API error {e.code}: {error_body[:300]}", None
+        except Exception as e:
+            print(f"DEBUG: Bedrock erase failed: {e}")
+            return False, f"Bedrock erase failed: {str(e)}", None
+
+    def _call_erase_variations_threaded(
+        self, image_data, mask_data, count, progress_label=None
+    ):
+        """
+        Produce `count` alternative erasures and return those that succeeded.
+
+        Each call uses its own random seed, which is what makes the results
+        differ. The calls run concurrently: they are network-bound and take
+        roughly 15 seconds each, so running them in sequence would triple the
+        wait for no benefit. A variation that fails (throttling, say) is dropped
+        and the rest are still used.
+        """
+        import concurrent.futures
+        import random
+
+        seeds = [random.randint(1, 4294967294) for _ in range(count)]
+        print(f"DEBUG: Requesting {count} erase variations, seeds {seeds}")
+
+        def operation():
+            results = []
+            errors = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                futures = {
+                    pool.submit(self._call_bedrock_erase, image_data, mask_data, None, seed): seed
+                    for seed in seeds
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    seed = futures[future]
+                    try:
+                        success, message, response = future.result()
+                    except Exception as e:
+                        success, message, response = False, str(e), None
+                    if success:
+                        results.append((seed, response))
+                    else:
+                        errors.append(f"seed {seed}: {message}")
+                        print(f"DEBUG: Erase variation {seed} failed: {message}")
+
+            if not results:
+                return {
+                    "success": False,
+                    "message": "; ".join(errors) or "All variations failed",
+                    "data": None,
+                }
+            return {
+                "success": True,
+                "message": f"{len(results)} of {count} variations succeeded",
+                "data": results,
+            }
+
+        return self._run_threaded_operation(
+            operation, "Bedrock erase API call", progress_label
+        )
+
+    def _call_edit_threaded(
+        self,
+        image_data,
+        mask_data,
+        prompt,
+        api_key,
+        size="1024x1024",
+        progress_label=None,
+    ):
+        """Threaded wrapper for the configured provider's edit call"""
+        provider = self._get_provider()
+
+        def operation():
+            if provider == "bedrock":
+                success, message, response = self._call_bedrock_edit(
+                    image_data, mask_data, prompt, progress_label
+                )
+            else:
+                success, message, response = self._call_openai_edit(
+                    image_data, mask_data, prompt, api_key, size, progress_label
+                )
+            return {"success": success, "message": message, "data": response}
+
+        return self._run_threaded_operation(
+            operation, f"{provider} edit API call", progress_label
+        )
+
     def _call_openai_edit_threaded(
         self,
         image_data,
@@ -3198,6 +3816,20 @@ class GimpAIPlugin(Gimp.PlugIn):
                     f"DEBUG: Extract region: ({ctx_x1},{ctx_y1}), size {ctx_width}x{ctx_height}"
                 )
 
+                # The padding crop below uses offsets that are only valid at the
+                # size we asked the API for, so normalise first if the provider
+                # returned something else.
+                if target_shape and (
+                    ai_result_img.get_width(),
+                    ai_result_img.get_height(),
+                ) != tuple(target_shape):
+                    print(
+                        f"DEBUG: AI result {ai_result_img.get_width()}x{ai_result_img.get_height()} "
+                        f"differs from requested {target_shape}, rescaling"
+                    )
+                    ai_result_img.scale(target_shape[0], target_shape[1])
+                    ai_layer = ai_result_img.get_layers()[0]
+
                 # Scale AI result back to extract region size if needed
                 if (
                     ai_layer.get_width() != ctx_width
@@ -3249,86 +3881,34 @@ class GimpAIPlugin(Gimp.PlugIn):
                 result_width = placement["result_width"]
                 result_height = placement["result_height"]
 
-                # Create new layer in original image for the composited result
-                result_layer = Gimp.Layer.new(
-                    image,
-                    "AI Inpaint Result",
-                    orig_width,
-                    orig_height,
-                    Gimp.ImageType.RGBA_IMAGE,
-                    100.0,
-                    Gimp.LayerMode.NORMAL,
-                )
+                # Place the AI result by copying it as a layer and offsetting
+                # it. The Gegl buffer-source -> translate -> write-buffer chain
+                # this replaced writes nothing at all under GIMP 3.2 (measured:
+                # zero pixels landed), so the result layer stayed empty and every
+                # inpaint looked like it had done nothing.
+                print(f"DEBUG: Placing {ctx_width}x{ctx_height} AI result at ({paste_x},{paste_y})")
 
-                # Insert layer at top
-                image.insert_layer(result_layer, None, 0)
-
-                print(f"DEBUG: USING PURE PLACEMENT FUNCTION:")
-                print(f"DEBUG: AI result is {result_width}x{result_height} square")
-                print(f"DEBUG: Placing at calculated position: ({paste_x},{paste_y})")
-                print(f"DEBUG: GIMP will automatically clip to image bounds")
-
-                # Copy the AI result content using simplified Gegl nodes
-                from gi.repository import Gegl
-
-                print(
-                    f"DEBUG: Placing {ctx_width}x{ctx_height} AI result at ({paste_x},{paste_y})"
-                )
-
-                # Clear selection before Gegl processing to prevent clipping, then restore it
-                print(
-                    "DEBUG: Saving and clearing selection before Gegl processing to prevent clipping"
-                )
                 selection_channel = Gimp.Selection.save(image)
-                Gimp.Selection.none(image)
 
-                # Get buffers
-                buffer = result_layer.get_buffer()
-                shadow_buffer = result_layer.get_shadow_buffer()
-                ai_buffer = ai_layer.get_buffer()
+                result_layer = Gimp.Layer.new_from_drawable(ai_layer, image)
+                result_layer.set_name("AI Inpaint Result")
+                image.insert_layer(result_layer, None, 0)
+                result_layer.set_offsets(paste_x, paste_y)
 
-                # Create simplified Gegl processing graph
-                graph = Gegl.Node()
+                # Alpha first: without it, growing the layer to canvas size
+                # fills the new area with opaque background instead of
+                # transparency, hiding the rest of the image.
+                result_layer.add_alpha()
+                result_layer.resize_to_image_size()
 
-                # Source: AI result square
-                ai_input = graph.create_child("gegl:buffer-source")
-                ai_input.set_property("buffer", ai_buffer)
-
-                # Translate to context square position
-                translate = graph.create_child("gegl:translate")
-                translate.set_property("x", float(paste_x))
-                translate.set_property("y", float(paste_y))
-
-                # Write to shadow buffer without clipping
-                output = graph.create_child("gegl:write-buffer")
-                output.set_property("buffer", shadow_buffer)
-
-                # Link simple chain: source -> translate -> output
-                ai_input.link(translate)
-                translate.link(output)
-
-                # Process the graph
-                try:
-                    output.process()
-
-                    # Flush and merge shadow buffer - update entire layer
-                    shadow_buffer.flush()
-                    result_layer.merge_shadow(True)
-
-                    # Update the entire layer
-                    result_layer.update(0, 0, orig_width, orig_height)
-
-                    print(f"DEBUG: Updated entire layer: {orig_width}x{orig_height}")
-
-                    print(
-                        f"DEBUG: Successfully composited AI result using simplified Gegl graph"
-                    )
-                except Exception as e:
-                    print(f"DEBUG: Gegl processing failed: {e}")
-                    raise
+                placed_x, placed_y = result_layer.get_offsets()[1:]
+                print(
+                    f"DEBUG: Result layer placed at ({placed_x},{placed_y}), "
+                    f"size {result_layer.get_width()}x{result_layer.get_height()}"
+                )
 
                 # Restore the original selection
-                print("DEBUG: Restoring original selection after Gegl processing")
+                print("DEBUG: Restoring original selection")
                 try:
                     pdb = Gimp.get_pdb()
                     select_proc = pdb.lookup_procedure("gimp-image-select-item")
@@ -3418,6 +3998,7 @@ class GimpAIPlugin(Gimp.PlugIn):
     def do_query_procedures(self):
         return [
             "gimp-ai-inpaint",
+            "gimp-ai-erase-object",
             "gimp-ai-layer-generator",
             "gimp-ai-layer-composite",
         ]
@@ -3428,6 +4009,14 @@ class GimpAIPlugin(Gimp.PlugIn):
                 self, name, Gimp.PDBProcType.PLUGIN, self.run_inpaint, None
             )
             procedure.set_menu_label("Inpainting")
+            procedure.add_menu_path("<Image>/Filters/AI/")
+            return procedure
+
+        elif name == "gimp-ai-erase-object":
+            procedure = Gimp.ImageProcedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self.run_erase_object, None
+            )
+            procedure.set_menu_label("Erase Object")
             procedure.add_menu_path("<Image>/Filters/AI/")
             return procedure
 
@@ -3448,6 +4037,145 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure
 
         return None
+
+    def run_erase_object(self, procedure, run_mode, image, drawables, config, run_data):
+        """
+        Erase Object - remove what is selected and fill from the surroundings.
+
+        Deliberately has no prompt and no options: select the thing, run this,
+        done. Removal is a single unambiguous operation, so asking the user to
+        describe it only invites the model to invent content instead.
+        """
+        print("DEBUG: AI Erase Object called!")
+        original_selected_layers = image.get_selected_layers()
+
+        selection_bounds = Gimp.Selection.bounds(image)
+        if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+            Gimp.message(
+                "❌ No Selection Found!\n\n"
+                "Erase Object removes whatever is selected.\n\n"
+                "Please:\n"
+                "1. Select the object you want gone\n"
+                "2. Run Filters → AI → Erase Object again"
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+
+        provider = self._get_provider()
+        if provider != "bedrock" or bedrock_client is None:
+            Gimp.message(
+                "❌ Erase Object requires Amazon Bedrock\n\n"
+                "It uses Stability's object-erase model, which has no OpenAI "
+                "equivalent.\n\n"
+                "Set the inpainting provider to Amazon Bedrock in "
+                "Filters → AI → Settings."
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+
+        self._log_bedrock_environment()
+        try:
+            bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
+        except bedrock_client.BedrockError as e:
+            Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+
+        self._init_gimp_ui()
+        dialog = self._create_dialog_base("AI Erase Object", size=(420, 140))
+        content_area = self._setup_dialog_content_area(dialog)
+        progress_frame, progress_label = self._create_progress_widget()
+        content_area.pack_start(progress_frame, False, False, 0)
+        content_area.show_all()
+        dialog.show_all()
+
+        try:
+            self._update_progress(progress_label, "🔍 Reading image...")
+            context_info = self._calculate_native_context_extraction(image)
+
+            success, message, image_data = self._extract_context_region(
+                image, context_info
+            )
+            if not success:
+                self._update_progress(progress_label, f"❌ {message}")
+                Gimp.message(f"❌ Context Extraction Failed: {message}")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.CANCEL, GLib.Error()
+                )
+
+            self._update_progress(progress_label, "🎭 Creating mask...")
+            mask_data = self._convert_mask_to_bedrock(
+                self._create_context_mask(
+                    image, context_info, context_info["target_size"]
+                )
+            )
+
+            variations = self.config.get("bedrock", {}).get("erase_variations", 3)
+            variations = max(1, min(4, int(variations)))
+            self._update_progress(
+                progress_label, f"🚀 Erasing ({variations} variations)..."
+            )
+            api_success, api_message, results = self._call_erase_variations_threaded(
+                image_data, mask_data, variations, progress_label
+            )
+
+            if not api_success:
+                if "cancelled" in api_message.lower():
+                    self._update_progress(progress_label, "❌ Cancelled")
+                    Gimp.message("❌ Operation cancelled by user")
+                else:
+                    self._update_progress(progress_label, f"❌ {api_message}")
+                    Gimp.message(f"❌ Erase Failed: {api_message}")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                )
+
+            self._update_progress(progress_label, "Placing results...")
+            # Paste the whole context window rather than masking back to the
+            # selection. The model returns the window with only the masked area
+            # changed (measured: ~3% of pixels) and has already blended across
+            # the mask edge, so re-masking to the selection rectangle would
+            # discard that blending and leave a visible rectangular seam.
+            #
+            # Composited in reverse so the first variation ends up on top: each
+            # result is inserted at the top of the stack.
+            placed = 0
+            last_message = ""
+            for seed, response in reversed(results):
+                ok, last_message = self._download_and_composite_result(
+                    image, response, context_info, "full"
+                )
+                if ok:
+                    placed += 1
+                    print(f"DEBUG: Placed erase variation (seed {seed})")
+                else:
+                    print(f"DEBUG: Failed to place variation {seed}: {last_message}")
+
+            if placed:
+                # Name them top-down and show only the first, so the user can
+                # step through the alternatives by toggling layer visibility.
+                for index, layer in enumerate(image.get_layers()[:placed], start=1):
+                    layer.set_name(
+                        "AI Erase Result" if placed == 1
+                        else f"AI Erase {index} of {placed}"
+                    )
+                    layer.set_visible(index == 1)
+                Gimp.displays_flush()
+
+                self._update_progress(
+                    progress_label,
+                    "✅ Object erased!" if placed == 1
+                    else f"✅ {placed} variations - toggle layer visibility to compare",
+                )
+                print(f"DEBUG: Erase complete - {placed} variation(s) placed")
+            else:
+                self._update_progress(progress_label, f"⚠️ {last_message}")
+                Gimp.message(f"⚠️ Erased but import failed: {last_message}")
+
+            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
+        finally:
+            if dialog:
+                dialog.destroy()
+            if original_selected_layers:
+                image.set_selected_layers(original_selected_layers)
 
     def run_inpaint(self, procedure, run_mode, image, drawables, config, run_data):
         print("DEBUG: AI Inpaint Selection called!")
@@ -3486,6 +4214,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             "",
             show_mode_selection=True,
             image=image,
+            provider=self._get_provider(),
         )
         print(f"DEBUG: Dialog returned: {repr(dialog_result)}")
 
@@ -3502,16 +4231,30 @@ class GimpAIPlugin(Gimp.PlugIn):
         print(f"DEBUG: Extracted prompt: '{prompt}', mode: '{selected_mode}'")
 
         try:
-            # Step 3: Get API key
-            api_key = self._get_api_key()
-            if not api_key:
-                self._update_progress(progress_label, "❌ No OpenAI API key found!")
-                Gimp.message(
-                    "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
-                )
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+            # Step 3: Get credentials for the configured provider
+            provider = self._get_provider()
+            print(f"DEBUG: Inpainting provider: {provider}")
+            api_key = None
+            if provider == "bedrock":
+                self._log_bedrock_environment()
+                try:
+                    bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
+                except bedrock_client.BedrockError as e:
+                    self._update_progress(progress_label, "❌ No AWS credentials found!")
+                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+            else:
+                api_key = self._get_api_key()
+                if not api_key:
+                    self._update_progress(progress_label, "❌ No OpenAI API key found!")
+                    Gimp.message(
+                        "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
+                    )
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
 
             # Create progress callback for thread-to-UI communication
             progress_callback = self._create_progress_callback(progress_label)
@@ -3575,6 +4318,11 @@ class GimpAIPlugin(Gimp.PlugIn):
                 image, context_info, context_info["target_size"]
             )
 
+            # Bedrock reads the mask from luminance, not alpha. Convert here, on
+            # the main thread, before the API call is handed to a worker thread.
+            if provider == "bedrock":
+                mask_data = self._convert_mask_to_bedrock(mask_data)
+
             self._update_progress(progress_label, "🚀 Starting AI processing...")
 
             # Determine the optimal size for OpenAI API
@@ -3590,7 +4338,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             print(f"DEBUG: Using OpenAI API size: {api_size}")
 
-            api_success, api_message, api_response = self._call_openai_edit_threaded(
+            api_success, api_message, api_response = self._call_edit_threaded(
                 image_data,
                 mask_data,
                 prompt,
@@ -3656,7 +4404,9 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         # Step 1: Show prompt dialog with layer selection
         print("DEBUG: Showing layer composite dialog...")
-        dialog_result = self._show_composite_dialog(image)
+        provider = self._get_provider()
+        print(f"DEBUG: Layer composite provider: {provider}")
+        dialog_result = self._show_composite_dialog(image, provider)
         print(f"DEBUG: Dialog returned: {repr(dialog_result)}")
 
         if not dialog_result:
@@ -3674,16 +4424,43 @@ class GimpAIPlugin(Gimp.PlugIn):
         )
 
         try:
-            # Step 2: Get API key
-            api_key = self._get_api_key()
-            if not api_key:
-                self._update_progress(progress_label, "❌ No OpenAI API key found!")
-                Gimp.message(
-                    "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
-                )
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+            # Step 2: Get credentials for the configured provider
+            api_key = None
+            if provider == "bedrock":
+                self._log_bedrock_environment()
+                try:
+                    bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
+                except bedrock_client.BedrockError as e:
+                    self._update_progress(progress_label, "❌ No AWS credentials found!")
+                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+
+                # Bedrock inpainting always needs a mask to know what to change
+                if not use_mask:
+                    self._update_progress(progress_label, "❌ Selection mask required")
+                    Gimp.message(
+                        "❌ Selection Required for Bedrock\n\n"
+                        "Amazon Bedrock composites into a masked region, so it needs "
+                        "a selection to work on.\n\n"
+                        "Please either:\n"
+                        "• Make a selection and tick 'Include selection mask', or\n"
+                        "• Switch the provider back to OpenAI in Settings"
+                    )
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+            else:
+                api_key = self._get_api_key()
+                if not api_key:
+                    self._update_progress(progress_label, "❌ No OpenAI API key found!")
+                    Gimp.message(
+                        "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
+                    )
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
 
             # Use existing layer preparation method
             self._update_progress(progress_label, "🔧 Preparing layers...")
@@ -3764,6 +4541,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                     mask_data = self._create_context_mask(
                         image, context_info, context_info["target_size"]
                     )
+                    if provider == "bedrock":
+                        mask_data = self._convert_mask_to_bedrock(mask_data)
                     print(
                         f"DEBUG: Created context-aware selection mask for composite {target_width}x{target_height}"
                     )
@@ -3786,15 +4565,34 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             self._update_progress(progress_label, "🚀 Starting AI processing...")
 
-            # Call OpenAI API with layer array using optimal shape
             target_width, target_height = optimal_shape
             api_size = f"{target_width}x{target_height}"
-            print(
-                f"DEBUG: Calling OpenAI API with {len(layer_data_list)} layers, size={api_size}..."
-            )
 
-            api_success, api_message, api_response = self._call_openai_edit_threaded(
-                layer_data_list,
+            if provider == "bedrock":
+                # Bedrock takes a single image, so composite the layers first
+                self._update_progress(progress_label, "🔧 Flattening layers...")
+                flatten_ok, flatten_message, api_image_data = (
+                    self._flatten_layers_for_bedrock(
+                        image, layers_for_api, context_info
+                    )
+                )
+                if not flatten_ok:
+                    self._update_progress(
+                        progress_label, f"❌ Layer flattening failed: {flatten_message}"
+                    )
+                    Gimp.message(f"❌ Layer Flattening Failed: {flatten_message}")
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+                print(f"DEBUG: Calling Bedrock with flattened layers, size={api_size}")
+            else:
+                api_image_data = layer_data_list
+                print(
+                    f"DEBUG: Calling OpenAI API with {len(layer_data_list)} layers, size={api_size}..."
+                )
+
+            api_success, api_message, api_response = self._call_edit_threaded(
+                api_image_data,
                 mask_data,
                 prompt,
                 api_key,

@@ -482,3 +482,85 @@ def check_coordinate_properties(img_width, img_height, sel_x1, sel_y1, sel_x2, s
     )
     
     return results
+
+# Stability's image models work internally at roughly one megapixel. Sending
+# more than that gains nothing - the service downsamples and the extra detail is
+# lost - and sending less means upscaling, which is worse: the model then sees
+# interpolated pixels and generates content to match them.
+NATIVE_TARGET_PIXELS = 1024 * 1024
+
+# Stability rejects images outside this aspect range.
+MIN_ASPECT = 1 / 2.5
+MAX_ASPECT = 2.5
+
+
+def calculate_native_context(img_width, img_height, sel_bounds,
+                             target_pixels=NATIVE_TARGET_PIXELS, min_margin=64):
+    """
+    Context window around a selection at native resolution, for providers that
+    accept arbitrary image sizes (Bedrock).
+
+    Unlike get_optimal_openai_shape(), this never upscales. A small selection
+    gets a large window of real pixels around it rather than a tight crop blown
+    up to a fixed shape; only windows above target_pixels are scaled down.
+
+    Args:
+        img_width, img_height: Source image size
+        sel_bounds: (x1, y1, x2, y2) selection bounds
+        target_pixels: Preferred working area in pixels
+        min_margin: Smallest context margin around the selection, in pixels
+
+    Returns:
+        dict with the same keys the rest of the pipeline expects:
+            extract_region: (x, y, width, height) in source coordinates
+            target_shape: (width, height) actually sent to the API
+            padding_info: scale_factor, scaled_size, padding (always zero here)
+    """
+    sel_x1, sel_y1, sel_x2, sel_y2 = sel_bounds
+    sel_width = max(1, sel_x2 - sel_x1)
+    sel_height = max(1, sel_y2 - sel_y1)
+
+    # Grow the selection outwards to about target_pixels, keeping it centred.
+    margin = max(min_margin, int(max(sel_width, sel_height) * 0.25))
+    side = max(int(target_pixels ** 0.5), sel_width + 2 * margin, sel_height + 2 * margin)
+
+    centre_x = (sel_x1 + sel_x2) // 2
+    centre_y = (sel_y1 + sel_y2) // 2
+    half = side // 2
+
+    # Clamp to the image, sliding the window back inside rather than shrinking it
+    x1 = max(0, min(centre_x - half, img_width - side))
+    y1 = max(0, min(centre_y - half, img_height - side))
+    x2 = min(img_width, x1 + side)
+    y2 = min(img_height, y1 + side)
+    x1 = max(0, x2 - side)
+    y1 = max(0, y2 - side)
+
+    width = x2 - x1
+    height = y2 - y1
+
+    # Keep within the provider's accepted aspect range
+    aspect = width / height
+    if aspect > MAX_ASPECT:
+        width = int(height * MAX_ASPECT)
+        x2 = x1 + width
+    elif aspect < MIN_ASPECT:
+        height = int(width / MIN_ASPECT)
+        y2 = y1 + height
+
+    # Only ever scale down
+    scale = 1.0
+    if width * height > target_pixels:
+        scale = (target_pixels / (width * height)) ** 0.5
+    scaled_width = max(64, int(width * scale))
+    scaled_height = max(64, int(height * scale))
+
+    return {
+        'extract_region': (x1, y1, width, height),
+        'target_shape': (scaled_width, scaled_height),
+        'padding_info': {
+            'scale_factor': scale,
+            'scaled_size': (scaled_width, scaled_height),
+            'padding': (0, 0, 0, 0),
+        },
+    }
