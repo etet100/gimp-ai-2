@@ -8,6 +8,8 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ### Key Features
 - **AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
+- **AI Erase Object**: Remove a selected object and fill from surrounding context; three variations per run (Bedrock only)
+- **AI Generative Upscale**: Enlarge the active layer with Stability's upscale models (Bedrock only)
 - **AI Image Generation**: Create new images from text descriptions as new layers
 - **AI Layer Composite**: Intelligently blend AI content into existing images
 - **Zero External Dependencies**: Uses only Python standard library + GIMP APIs
@@ -32,7 +34,13 @@ This file provides guidance to GitHub Copilot when working with code in this rep
   - Generations endpoint for creating images
   - Edits endpoint for inpainting
 - **Amazon Bedrock Runtime** (`https://bedrock-runtime.{region}.amazonaws.com/model/{id}/invoke`)
-  - Stability AI inpainting model; serves inpainting and layer composite
+  - Stability AI models: inpainting, layer composite, object erase, generation
+  - Editing models need a geography-prefixed inference profile; the generation
+    model must NOT have one, and lives in a different region (`us-west-2`)
+  - Upscale models each have their own quirks: fast accepts `image` and
+    `output_format` only and caps sides at 1536px; conservative and creative
+    require a non-empty prompt. All three must request WebP, because a large
+    PNG response exceeds Bedrock's 16MB payload cap
   - SigV4-signed with the standard library (see `bedrock_client.py`)
 
 ## Architecture
@@ -41,7 +49,8 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 1. **`gimp-ai-plugin.py`** (Main plugin, ~4000 lines)
    - `GimpAIPlugin` class: Main plugin entry point
-   - Procedure registration (4 procedures: inpainting, erase object, generation, composite)
+   - Procedure registration (5 procedures: inpainting, erase object, generative
+     upscale, generation, composite)
    - Configuration management (API key storage)
    - UI dialogs (GTK-based settings and progress)
    - OpenAI API communication
@@ -137,13 +146,20 @@ class MyPlugin(Gimp.PlugIn):
   Rebinding the plugin methods onto a plain object is required - instantiating
   `GimpAIPlugin` outside the plug-in protocol aborts GIMP
 - **Manual testing**: Required for UI and GIMP integration
-  - Test all three procedures: inpainting, generation, composite
+  - Test all five procedures: inpainting, erase object, generative upscale, generation, composite
   - Test with various image sizes and aspect ratios
   - Test cancellation behavior
   - Test error handling (invalid API keys, network failures)
 
 ### Running Tests
 ```bash
+# Offline: signing, credentials, request bodies for every model
+python3 bedrock_client.py
+
+# Offline: coordinate transformations and native context windows
+python3 tests/run_tests.py
+python3 tests/test_native_context.py
+
 # Unit tests (for coordinate_utils.py)
 python3 -m pytest tests/
 
@@ -225,12 +241,15 @@ Detailed algorithms documented in `ALGORITHMS.md`.
 ### Making Changes
 
 1. **Test locally first**: Copy to GIMP plugin dir and restart GIMP
-2. **Test all three features**: Inpainting, generation, composite
+2. **Test all five features**: Inpainting, erase object, generative upscale, generation, composite
 3. **Test error paths**: Invalid inputs, API failures, cancellation
 4. **Update documentation**: If adding features or changing behavior
 5. **Consider coordinate_utils.py**: If adding coordinate logic, keep it pure (no GIMP deps)
 
 ### Common Tasks
+
+**Menu items** (`Filters → AI`): Inpainting, Erase Object, Generative Upscale,
+Image Generator, Layer Composite.
 
 **Adding a new procedure:**
 1. Add procedure name to `do_query_procedures()`
@@ -325,7 +344,7 @@ the mask entirely unless it happens to be in the top-left corner.
 - [ ] Code follows Python conventions (PEP 8)
 - [ ] No external dependencies added (unless absolutely necessary)
 - [ ] Plugin loads and appears in GIMP menu
-- [ ] All three features still work (inpainting, generation, composite)
+- [ ] All five features still work (inpainting, erase object, generative upscale, generation, composite)
 - [ ] Error handling is appropriate
 - [ ] Documentation updated if needed
 - [ ] No API keys committed to repository

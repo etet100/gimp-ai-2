@@ -11,3 +11,8 @@ tests/erase_test_*.png
 tests/erase_test_result.txt
 tests/probe_*.png
 tests/probe_result.txt
+tests/generate_test_*.png
+tests/generate_test_result.txt
+tests/*.log
+tests/fit_test_result.txt
+tests/upscale_test_result.txt

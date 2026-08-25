@@ -8,6 +8,7 @@
     "bedrock": {
         "region": "us-east-1",
         "model_id": "stability.stable-image-inpaint-v1:0",
+        "erase_model_id": "stability.stable-image-erase-object-v1:0",
         "api_key": "",
         "access_key_id": "",
         "secret_access_key": "",
@@ -15,7 +16,11 @@
         "negative_prompt": "",
         "seed": 0,
         "grow_mask": 5,
-        "erase_variations": 3
+        "erase_variations": 3,
+        "generation_region": "us-west-2",
+        "generation_model_id": "stability.sd3-5-large-v1:0",
+        "upscale_variant": "conservative",
+        "upscale_creativity": 0.35
     },
     "settings": {
         "image_quality": 0.85,

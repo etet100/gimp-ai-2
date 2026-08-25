@@ -2,22 +2,23 @@
 
 A Python plugin for GIMP 3.0.4+ that integrates AI image generation capabilities directly into GIMP. This is a **beta release** seeking testers on all platforms.
 
-Supports **OpenAI's gpt-image-1** models for inpainting and image generation, and **Amazon Bedrock** (Stability AI inpainting) as an alternative provider for inpainting and layer compositing.
+Supports **OpenAI's gpt-image-1** and **Amazon Bedrock** (Stability AI) as alternative providers. Object removal and generative upscaling are Bedrock-only, since OpenAI has no equivalent models.
 
 ## ✨ Features
 
 - **🎨 AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
 - **🧹 AI Erase Object**: Remove something from a photo and fill the gap from its surroundings - select it, run it, no prompt, three alternatives to choose from
+- **🔍 AI Generative Upscale**: Enlarge the active layer with a model instead of plain resampling - Fast, Conservative or Creative
 - **🖼️ AI Image Generation**: Create new images from text descriptions as new layers
 - **🔄 AI Layer Composite**: Intelligently blend AI content into existing images
 - **⚙️ Easy Configuration**: Built-in settings dialog, no external config files needed
-- **☁️ Choice of provider**: Inpaint and composite through OpenAI or Amazon Bedrock
+- **☁️ Choice of provider**: OpenAI or Amazon Bedrock, chosen in Settings
 
 ## 📋 Requirements
 
 - **GIMP 3.0.4 or newer** (all GIMP 3.X versions from 3.0.4 onwards)
 - **Internet connection** for AI API calls
-- **OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)), or **AWS credentials with Amazon Bedrock access** if you inpaint through Bedrock
+- **OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)), or **AWS credentials with Amazon Bedrock access**. Erase Object and Generative Upscale require Bedrock
 - **Zero external dependencies** - uses only Python standard library + GIMP APIs
 
 ## 🚀 Installation
@@ -88,14 +89,15 @@ plug-ins/
 
 > **First time?** See [INSTALL.md](INSTALL.md) for detailed API key instructions.
 
-### Amazon Bedrock (inpainting only)
+### Amazon Bedrock
 
-1. **Request model access** for Stability AI's inpainting model in the
-   [Bedrock console](https://console.aws.amazon.com/bedrock/) under Model access
-2. In GIMP: go to `Filters → AI → Settings`
-3. Set **Inpainting Provider** to *Amazon Bedrock*
-4. Set the **AWS region** you enabled the model in (default `us-east-1`)
-5. Provide credentials one of these ways:
+Bedrock serves models on demand - there is no model-access request to submit
+first, so this is just credentials and a region.
+
+1. In GIMP: go to `Filters → AI → Settings`
+2. Set **Inpainting Provider** to *Amazon Bedrock*
+3. Set the **AWS region** (default `us-east-1`)
+4. Provide credentials one of these ways:
    - Type an **access key ID** and **secret access key** into the settings dialog.
      They are saved to `config.json`, which is written with mode 600. Use the
      *Clear Stored AWS Credentials* button to remove them again
@@ -114,9 +116,13 @@ cross-region inference profile for your region (`us.`, `eu.` or `apac.`), which
 the plugin adds automatically. Stability's older SDXL 1.0 model
 (`stability.stable-diffusion-xl-v1`) is no longer offered on Bedrock.
 
-Bedrock serves both **AI Inpainting** and **AI Layer Composite**. Image
-generation is OpenAI-only, since it needs a text-to-image model rather than an
-inpainting one.
+Bedrock serves **AI Inpainting**, **AI Layer Composite**, **AI Erase Object**,
+**AI Generative Upscale** and **AI Image Generator**.
+
+> **Generation uses a different region.** Stability's text-to-image models are
+> not offered in `us-east-1`, where the editing models live, so generation has
+> its own `generation_region` setting (default `us-west-2`). No extra setup is
+> needed for it - the same credentials work in both regions.
 
 Layer composite behaves differently on the two providers. OpenAI receives each
 selected layer as a separate image and can use one as a reference for another.
@@ -186,12 +192,58 @@ quality:
 Tip: include a little of the object's shadow or contact points in the selection.
 A mask that stops exactly at the outline tends to leave a ghost behind.
 
+### AI Generative Upscale
+
+**Enlarge a layer with a model rather than plain resampling**
+
+1. **Select the layer** you want enlarged in the Layers dialog
+2. **Go to** `Filters → AI → Generative Upscale`
+3. **Pick a method** from the dropdown and optionally describe the image
+
+It works on the **active layer**, not the whole image, so you can upscale one
+layer and keep the original beside it for comparison.
+
+| Method | Result | Time | Prompt |
+|---|---|---|---|
+| **Fast** | exactly 4x, but the input is capped at 1536px per side, so a large layer is reduced first | ~6s | ignored |
+| **Conservative** | to about 4K, staying close to the original | ~32s | used |
+| **Creative** | to about 4K, inventing extra detail | ~68s | used |
+
+Measured on a 2048x1536 photo: Fast reduced it to 1182x886 and returned
+4728x3544; Conservative and Creative took the full size and returned 3592x2696
+and 3632x2728. So Fast gives the largest output but from a reduced input, while
+the other two preserve what was there.
+
+Conservative and Creative require a prompt; if you leave the box empty a neutral
+one is used. The result is added as a new layer larger than the canvas - use
+`Image → Fit Canvas to Layers` to see all of it.
+
+Requires Amazon Bedrock as the provider.
+
 ### AI Image Generation
 
 1. **Open or create** any GIMP document
 2. **Go to** `Filters → AI → Image Generator`
 3. **Enter prompt** (e.g., "a red dragon on mountain")
 4. **New layer created** with generated image
+
+Generation always produces a **whole-canvas layer** - it does not read your
+selection. To generate into a selected area, use **Inpainting**, which is exactly
+that operation: a prompt plus a selection mask.
+
+Generation models return their own resolution (Stability gives about a megapixel
+at the nearest aspect ratio it supports; OpenAI one of three fixed sizes), which
+rarely matches your canvas. The generated layer is therefore scaled to **cover**
+the canvas and centred: the tighter axis matches exactly and the other overhangs,
+so there is no gap and the excess can be cropped or repositioned.
+
+GIMP 3 has no Lanczos filter - it was replaced by NoHalo and LoHalo. The plugin
+uses NoHalo when enlarging and LoHalo when reducing, which are the intended
+modern equivalents.
+
+On Bedrock, generation runs in its own region (`us-west-2` by default) because
+Stability's generation models are not offered in the region the editing models
+use. See [Configuration](#-configuration).
 
 ### AI Layer Composite
 
@@ -222,6 +274,7 @@ A mask that stops exactly at the outline tends to leave a ghost behind.
 ## 📚 Documentation
 
 - **[INSTALL.md](INSTALL.md)** - Complete installation guide for users
+- **[BEDROCK.md](BEDROCK.md)** - Amazon Bedrock support: models, API quirks, bugs found and how each was verified
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Common issues and solutions
 - **[CHANGELOG.md](CHANGELOG.md)** - What's new and known issues
 - **[TODO.md](TODO.md)** - Development roadmap
@@ -243,6 +296,20 @@ Releases are automated via GitHub Actions. See **[RELEASE.md](RELEASE.md)** for 
 
 - **`build_release.py`** - Creates distributable ZIP packages (used by workflow)
 - **`tools/bump_version.py`** - Bumps version in `gimp-ai-plugin.py` (used by workflow)
+
+### Tests
+
+```bash
+python3 bedrock_client.py          # signing, credentials, request bodies
+python3 tests/run_tests.py          # coordinate transformations
+python3 tests/test_native_context.py
+
+# These run inside GIMP; some make live Bedrock calls
+gimp -i --batch-interpreter=python-fu-eval \
+     -b "import runpy; runpy.run_path('$PWD/tests/test_gimp_pipeline.py')"
+```
+
+See [BEDROCK.md](BEDROCK.md) for the full list and what each covers.
 
 ## ⚖️ License
 

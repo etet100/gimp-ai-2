@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bedrock instead of OpenAI, using Stability AI's inpainting model
   (`stability.stable-image-inpaint-v1:0`) via its cross-region inference profile.
 
-  - Applies to **AI Inpainting**, **AI Layer Composite** and the new
-    **AI Erase Object**
+  - Applies to **AI Inpainting**, **AI Layer Composite**, **AI Image Generator**
+    and the new **AI Erase Object**
   - Provider is selected in `Filters → AI → Settings`
   - Credentials come from an access key/secret typed into Settings, a Bedrock
     API key, environment variables, or `~/.aws`
@@ -35,7 +35,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     visible), run concurrently so all three take about as long as one -
     measured at 17s. Configurable via `bedrock.erase_variations` (1-4)
 
+- **Bedrock image generation** via `stability.sd3-5-large-v1:0`. Note that
+  Stability's generation models are only offered in `us-west-2`, not the
+  `us-east-1` where the editing models live, so generation has its own
+  `bedrock.generation_region` setting. They are also invoked on-demand with a
+  bare model id: an inference-profile prefix is rejected with "The provided
+  model identifier is invalid."
+
+- **AI Generative Upscale** (`Filters → AI → Generative Upscale`): enlarges the
+  **active layer** using Stability's upscale models, chosen from a dropdown -
+  Fast (4x, ~6s), Conservative (~4K, ~32s) or Creative (~4K, ~68s).
+
+  - Fast accepts only `image` and `output_format`; any other field, `seed`
+    included, is rejected outright
+  - Fast also caps input at 1536px per side, so larger layers are reduced first
+  - Conservative and Creative require a non-empty prompt; a neutral default is
+    substituted when the user leaves it blank
+  - All three request WebP: a large PNG response exceeds Bedrock's 16MB payload
+    cap (Fast hit it at 4728x3544, 38.8MB)
+
 ### Changed
+
+- Generated layers are now scaled to cover the canvas and centred, instead of
+  being dropped in at the model's own resolution and leaving a gap. Uses NoHalo
+  for enlarging and LoHalo for reducing (GIMP 3 has no Lanczos)
 
 - Settings dialog is now two columns and scrollable, so the Save button stays
   reachable on 1080p and smaller screens
@@ -80,7 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- Image generation remains OpenAI-only
+- Stability generation takes an aspect ratio, not pixel dimensions, and returns
+  about a megapixel at that ratio. The canvas shape is mapped to the nearest
+  ratio it accepts, so a 4:3 canvas becomes 5:4 rather than 3:2
 - Layer composite works differently on Bedrock: its inpainting model takes a
   single image, so the selected layers are flattened by GIMP first and the model
   only sees the combined pixels. A selection mask is required

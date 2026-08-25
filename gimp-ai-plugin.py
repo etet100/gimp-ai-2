@@ -1939,6 +1939,249 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         return result["success"], result["message"], result["data"]
 
+    def _show_upscale_dialog(self):
+        """Dialog for Generative Upscale: variant dropdown plus optional prompt"""
+        try:
+            self._init_gimp_ui()
+            dialog = self._create_dialog_base("AI Generative Upscale", size=(520, 300))
+            dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            ok_button = dialog.add_button("Upscale", Gtk.ResponseType.OK)
+            ok_button.set_can_default(True)
+            ok_button.grab_default()
+
+            content_area = self._setup_dialog_content_area(dialog, spacing=10)
+
+            api_warning_bar, needs_config = self._add_api_warning_bar(
+                content_area, dialog, self._get_provider()
+            )
+            if needs_config:
+                ok_button.set_sensitive(False)
+                ok_button.set_label("Configure & Continue")
+
+            label = Gtk.Label(label="Upscale method:")
+            label.set_halign(Gtk.Align.START)
+            content_area.pack_start(label, False, False, 0)
+
+            variants = ["fast", "conservative", "creative"]
+            combo = Gtk.ComboBoxText()
+            combo.append_text("Fast - 4x, a few seconds, no prompt")
+            combo.append_text("Conservative - to ~4K, preserves the original closely")
+            combo.append_text("Creative - to ~4K, invents detail, slowest")
+            last = self.config.get("bedrock", {}).get("upscale_variant", "conservative")
+            combo.set_active(variants.index(last) if last in variants else 1)
+            content_area.pack_start(combo, False, False, 0)
+
+            prompt_label = Gtk.Label(
+                label="Describe the image (used by Conservative and Creative):"
+            )
+            prompt_label.set_halign(Gtk.Align.START)
+            content_area.pack_start(prompt_label, False, False, 0)
+
+            prompt_entry = Gtk.Entry()
+            prompt_entry.set_placeholder_text(bedrock_client.DEFAULT_UPSCALE_PROMPT)
+            prompt_entry.set_text(self.config.get("last_upscale_prompt", ""))
+            content_area.pack_start(prompt_entry, False, False, 0)
+
+            info = Gtk.Label()
+            info.set_text(
+                "Upscales the active layer, not the whole image. Fast only accepts "
+                "layers up to 1536px per side; larger layers are reduced to fit "
+                "before upscaling."
+            )
+            info.set_line_wrap(True)
+            info.set_max_width_chars(56)
+            info.set_xalign(0.0)
+            info.get_style_context().add_class("dim-label")
+            content_area.pack_start(info, False, False, 0)
+
+            progress_frame, progress_label = self._create_progress_widget()
+            content_area.pack_start(progress_frame, False, False, 0)
+
+            content_area.show_all()
+
+            while True:
+                response = dialog.run()
+                if response == Gtk.ResponseType.OK:
+                    provider = self._get_provider()
+                    if not self._credentials_ready(provider):
+                        self._show_settings_dialog(dialog)
+                        provider = self._get_provider()
+                        if not self._credentials_ready(provider):
+                            continue
+                        if api_warning_bar:
+                            api_warning_bar.hide()
+                        ok_button.set_sensitive(True)
+                        ok_button.set_label("Upscale")
+                        continue
+
+                    variant = variants[max(0, combo.get_active())]
+                    prompt = prompt_entry.get_text().strip()
+                    self.config.setdefault("bedrock", {})["upscale_variant"] = variant
+                    self.config["last_upscale_prompt"] = prompt
+                    self._save_config()
+                    return dialog, progress_label, variant, prompt
+
+                if response in (Gtk.ResponseType.APPLY, Gtk.ResponseType.HELP):
+                    self._show_settings_dialog(dialog)
+                    if self._credentials_ready(self._get_provider()):
+                        if api_warning_bar:
+                            api_warning_bar.hide()
+                        ok_button.set_sensitive(True)
+                        ok_button.set_label("Upscale")
+                    continue
+
+                dialog.destroy()
+                return None
+
+        except Exception as e:
+            print(f"DEBUG: Upscale dialog error: {e}")
+            return None
+
+    def _call_bedrock_upscale(self, variant, image_data, prompt, progress_label=None):
+        """Call one of the Bedrock upscale models. Returns (ok, message, bytes)."""
+        try:
+            bedrock_config = self.config.get("bedrock", {})
+            creds = bedrock_client.upscale_credentials(bedrock_config, variant)
+            spec = bedrock_client.UPSCALE_VARIANTS[variant]
+            print(f"DEBUG: Upscaling with {creds['model_id']} in {creds['region']}")
+
+            body = bedrock_client.build_upscale_body(
+                variant,
+                image_data,
+                prompt=prompt,
+                creativity=bedrock_config.get("upscale_creativity", 0.35),
+                seed=bedrock_config.get("seed", 0),
+            )
+            url, headers = bedrock_client.build_invoke_request(creds, body)
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+            # Creative takes about a minute; the others are quicker
+            with self._make_url_request(req, timeout=300) as response:
+                response_json = json.loads(response.read().decode("utf-8"))
+
+            finish_reasons = response_json.get("finish_reasons") or [None]
+            if finish_reasons[0]:
+                return False, f"Bedrock refused the request: {finish_reasons[0]}", None
+            if not response_json.get("images"):
+                return False, "Bedrock returned no image", None
+
+            data = base64.b64decode(response_json["images"][0])
+            print(f"DEBUG: Upscale returned {len(data)} bytes ({spec['output_format']})")
+            return True, "Upscale successful", data
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            print(f"DEBUG: Upscale HTTP error: {e.code} - {error_body}")
+            return False, f"Bedrock API error {e.code}: {error_body[:300]}", None
+        except Exception as e:
+            print(f"DEBUG: Upscale failed: {e}")
+            return False, f"Upscale failed: {str(e)}", None
+
+    def _call_upscale_threaded(self, variant, image_data, prompt, progress_label=None):
+        """Threaded wrapper so the UI stays responsive during the upscale"""
+        def operation():
+            success, message, data = self._call_bedrock_upscale(
+                variant, image_data, prompt, progress_label
+            )
+            return {"success": success, "message": message, "data": data}
+
+        return self._run_threaded_operation(
+            operation, f"Bedrock {variant} upscale", progress_label, max_wait_time=420
+        )
+
+    def _export_layer_for_upscale(self, layer, variant):
+        """
+        Export the active layer as base64 PNG, reduced first if the variant
+        cannot accept it at full size.
+        """
+        width, height = layer.get_width(), layer.get_height()
+        send_width, send_height = bedrock_client.upscale_input_size(
+            variant, width, height
+        )
+
+        temp_image = Gimp.Image.new(width, height, Gimp.ImageBaseType.RGB)
+        try:
+            copy = Gimp.Layer.new_from_drawable(layer, temp_image)
+            temp_image.insert_layer(copy, None, 0)
+            copy.set_offsets(0, 0)
+            temp_image.flatten()
+
+            if (send_width, send_height) != (width, height):
+                Gimp.context_push()
+                try:
+                    Gimp.context_set_interpolation(Gimp.InterpolationType.LOHALO)
+                    temp_image.scale(send_width, send_height)
+                finally:
+                    Gimp.context_pop()
+                print(
+                    f"DEBUG: Reduced layer {width}x{height} -> {send_width}x{send_height} "
+                    f"to fit the {variant} upscale input limit"
+                )
+
+            png = self._export_layer_to_png(temp_image)
+            if not png:
+                return None, (width, height), (send_width, send_height)
+            return (
+                base64.b64encode(png).decode("utf-8"),
+                (width, height),
+                (send_width, send_height),
+            )
+        finally:
+            temp_image.delete()
+
+    def _call_bedrock_generation(self, prompt, width, height, progress_label=None):
+        """
+        Text-to-image through Bedrock. Returns raw PNG bytes.
+
+        Stability takes an aspect ratio rather than pixel dimensions and returns
+        roughly a megapixel at that ratio, so the canvas shape is mapped to the
+        nearest ratio it accepts.
+        """
+        try:
+            if not prompt or not prompt.strip():
+                return False, "Error: Empty prompt provided", None
+
+            bedrock_config = self.config.get("bedrock", {})
+            creds = bedrock_client.generation_credentials(bedrock_config)
+            ratio = bedrock_client.aspect_ratio_for(width, height)
+            print(
+                f"DEBUG: Bedrock generation with {creds['model_id']} in "
+                f"{creds['region']}, canvas {width}x{height} -> aspect {ratio}"
+            )
+
+            body = bedrock_client.build_generation_body(
+                prompt,
+                aspect_ratio=ratio,
+                negative_prompt=bedrock_config.get("negative_prompt", ""),
+                seed=bedrock_config.get("seed", 0),
+            )
+            url, headers = bedrock_client.build_invoke_request(creds, body)
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+            if progress_label:
+                self._update_progress(progress_label, "Generating image...", 0.5)
+
+            with self._make_url_request(req, timeout=180) as response:
+                response_json = json.loads(response.read().decode("utf-8"))
+
+            finish_reasons = response_json.get("finish_reasons") or [None]
+            if finish_reasons[0]:
+                return False, f"Bedrock refused the request: {finish_reasons[0]}", None
+            if not response_json.get("images"):
+                return False, "Bedrock returned no image", None
+
+            image_data = base64.b64decode(response_json["images"][0])
+            print(f"DEBUG: Bedrock generated {len(image_data)} bytes")
+            return True, "Image generation successful", image_data
+
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            print(f"DEBUG: Bedrock generation HTTP error: {e.code} - {error_body}")
+            return False, f"Bedrock API error {e.code}: {error_body[:300]}", None
+        except Exception as e:
+            print(f"DEBUG: Bedrock generation failed: {e}")
+            return False, f"Bedrock generation failed: {str(e)}", None
+
     def _call_openai_generation(
         self, prompt, api_key, size="auto", progress_label=None
     ):
@@ -2012,6 +2255,27 @@ class GimpAIPlugin(Gimp.PlugIn):
         except Exception as e:
             print(f"ERROR: GPT-Image-1 generation API call failed: {str(e)}")
             return False, str(e), None
+
+    def _call_generation_threaded(
+        self, prompt, api_key, width, height, progress_label=None
+    ):
+        """Threaded wrapper dispatching generation to the configured provider"""
+        provider = self._get_provider()
+
+        def operation():
+            if provider == "bedrock":
+                success, message, data = self._call_bedrock_generation(
+                    prompt, width, height, progress_label
+                )
+            else:
+                success, message, data = self._call_openai_generation(
+                    prompt, api_key, "auto", progress_label
+                )
+            return {"success": success, "message": message, "data": data}
+
+        return self._run_threaded_operation(
+            operation, f"{provider} generation API call", progress_label
+        )
 
     def _call_openai_generation_threaded(
         self, prompt, api_key, size="auto", progress_label=None
@@ -3999,6 +4263,7 @@ class GimpAIPlugin(Gimp.PlugIn):
         return [
             "gimp-ai-inpaint",
             "gimp-ai-erase-object",
+            "gimp-ai-upscale",
             "gimp-ai-layer-generator",
             "gimp-ai-layer-composite",
         ]
@@ -4020,6 +4285,14 @@ class GimpAIPlugin(Gimp.PlugIn):
             procedure.add_menu_path("<Image>/Filters/AI/")
             return procedure
 
+        elif name == "gimp-ai-upscale":
+            procedure = Gimp.ImageProcedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self.run_upscale, None
+            )
+            procedure.set_menu_label("Generative Upscale")
+            procedure.add_menu_path("<Image>/Filters/AI/")
+            return procedure
+
         elif name == "gimp-ai-layer-generator":
             procedure = Gimp.ImageProcedure.new(
                 self, name, Gimp.PDBProcType.PLUGIN, self.run_layer_generator, None
@@ -4037,6 +4310,124 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure
 
         return None
+
+    def run_upscale(self, procedure, run_mode, image, drawables, config, run_data):
+        """
+        Generative Upscale - enlarge the active layer using a Stability model.
+
+        Works on the active layer rather than the whole image, so an upscaled
+        result can be dropped alongside the original for comparison.
+        """
+        print("DEBUG: AI Generative Upscale called!")
+        original_selected_layers = image.get_selected_layers()
+
+        if not original_selected_layers:
+            Gimp.message(
+                "❌ No Active Layer\n\n"
+                "Generative Upscale works on the active layer.\n"
+                "Select a layer in the Layers dialog and try again."
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+
+        source_layer = original_selected_layers[0]
+
+        if self._get_provider() != "bedrock" or bedrock_client is None:
+            Gimp.message(
+                "❌ Generative Upscale requires Amazon Bedrock\n\n"
+                "It uses Stability's upscale models, which have no OpenAI "
+                "equivalent.\n\n"
+                "Set the inpainting provider to Amazon Bedrock in "
+                "Filters → AI → Settings."
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+
+        dialog_result = self._show_upscale_dialog()
+        if not dialog_result:
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+        dialog, progress_label, variant, prompt = dialog_result
+
+        try:
+            self._log_bedrock_environment()
+            try:
+                bedrock_client.upscale_credentials(
+                    self.config.get("bedrock", {}), variant
+                )
+            except bedrock_client.BedrockError as e:
+                self._update_progress(progress_label, "❌ No AWS credentials found!")
+                Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.CANCEL, GLib.Error()
+                )
+
+            self._update_progress(progress_label, "🔍 Preparing layer...")
+            image_data, original_size, sent_size = self._export_layer_for_upscale(
+                source_layer, variant
+            )
+            if not image_data:
+                self._update_progress(progress_label, "❌ Could not export the layer")
+                Gimp.message("❌ Could not export the active layer")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.CANCEL, GLib.Error()
+                )
+
+            note = ""
+            if sent_size != original_size:
+                note = (
+                    f" (reduced from {original_size[0]}x{original_size[1]} to fit "
+                    f"the {variant} input limit)"
+                )
+            self._update_progress(
+                progress_label,
+                f"🚀 Upscaling {sent_size[0]}x{sent_size[1]} with {variant}...{note}",
+            )
+
+            ok, message, data = self._call_upscale_threaded(
+                variant, image_data, prompt, progress_label
+            )
+            if not ok:
+                if "cancelled" in message.lower():
+                    self._update_progress(progress_label, "❌ Cancelled")
+                    Gimp.message("❌ Operation cancelled by user")
+                else:
+                    self._update_progress(progress_label, f"❌ {message}")
+                    Gimp.message(f"❌ Upscale Failed: {message}")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                )
+
+            self._update_progress(progress_label, "Placing result...")
+            suffix = "." + bedrock_client.UPSCALE_VARIANTS[variant]["output_format"]
+            new_layer = self._add_layer_from_bytes(
+                image, data, suffix, f"AI Upscale ({variant})",
+                offsets=source_layer.get_offsets()[1:],
+            )
+            if not new_layer:
+                self._update_progress(progress_label, "❌ Could not load the result")
+                Gimp.message("❌ Upscale returned an image GIMP could not load")
+                return procedure.new_return_values(
+                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                )
+
+            factor = new_layer.get_width() / max(1, original_size[0])
+            self._update_progress(
+                progress_label,
+                f"✅ Upscaled to {new_layer.get_width()}x{new_layer.get_height()} "
+                f"({factor:.1f}x)",
+            )
+            Gimp.message(
+                f"✅ Upscaled to {new_layer.get_width()}x{new_layer.get_height()} "
+                f"({factor:.1f}x the original layer).\n\n"
+                "The new layer is larger than the canvas. Use "
+                "Image → Fit Canvas to Layers to see all of it."
+            )
+            Gimp.displays_flush()
+            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+
+        finally:
+            if dialog:
+                dialog.destroy()
+            if original_selected_layers:
+                image.set_selected_layers(original_selected_layers)
 
     def run_erase_object(self, procedure, run_mode, image, drawables, config, run_data):
         """
@@ -4896,6 +5287,98 @@ class GimpAIPlugin(Gimp.PlugIn):
         )
         return result["success"]
 
+    def _fit_generated_layer(self, image, layer):
+        """
+        Scale a generated layer to cover the canvas, centred.
+
+        Generation models return their own resolution - Stability gives roughly a
+        megapixel at the nearest aspect ratio it supports, OpenAI one of three
+        fixed sizes - which rarely matches the canvas. Scaling to *cover* means
+        the tighter axis matches exactly and the other overhangs, so there is no
+        gap and the excess can be cropped. Scaling to fit instead would leave
+        empty canvas.
+
+        GIMP 3 has no Lanczos filter; it was replaced by NoHalo and LoHalo.
+        NoHalo is the one intended for enlarging, LoHalo for reducing.
+        """
+        canvas_width, canvas_height = image.get_width(), image.get_height()
+        layer_width, layer_height = layer.get_width(), layer.get_height()
+        if not layer_width or not layer_height:
+            return
+
+        scale = max(canvas_width / layer_width, canvas_height / layer_height)
+        if abs(scale - 1.0) < 0.005:
+            layer.set_offsets(
+                (canvas_width - layer_width) // 2, (canvas_height - layer_height) // 2
+            )
+            return
+
+        new_width = max(1, round(layer_width * scale))
+        new_height = max(1, round(layer_height * scale))
+
+        Gimp.context_push()
+        try:
+            Gimp.context_set_interpolation(
+                Gimp.InterpolationType.NOHALO if scale > 1.0
+                else Gimp.InterpolationType.LOHALO
+            )
+            layer.scale(new_width, new_height, False)
+        finally:
+            Gimp.context_pop()
+
+        layer.set_offsets(
+            (canvas_width - new_width) // 2, (canvas_height - new_height) // 2
+        )
+        print(
+            f"DEBUG: Fitted generated layer {layer_width}x{layer_height} -> "
+            f"{new_width}x{new_height} (scale {scale:.3f}) to cover "
+            f"{canvas_width}x{canvas_height} canvas"
+        )
+
+    def _add_layer_from_bytes(self, image, data, suffix, name, offsets=(0, 0)):
+        """
+        Add encoded image bytes as a new layer, without fitting to the canvas.
+
+        Separate from _add_layer_from_data because upscale results are meant to
+        exceed the canvas, and because they arrive as WebP or JPEG rather than
+        PNG - the suffix matters, since GIMP picks its loader from the filename.
+        """
+        temp_path = None
+        loaded = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = handle.name
+
+            loaded = Gimp.file_load(
+                Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(temp_path)
+            )
+            if not loaded or not loaded.get_layers():
+                return None
+
+            new_layer = Gimp.Layer.new_from_drawable(loaded.get_layers()[0], image)
+            new_layer.set_name(name)
+            image.insert_layer(new_layer, None, 0)
+            new_layer.set_offsets(int(offsets[0]), int(offsets[1]))
+            print(
+                f"DEBUG: Added {name}: {new_layer.get_width()}x{new_layer.get_height()} "
+                f"at {offsets}"
+            )
+            return new_layer
+        except Exception as e:
+            print(f"DEBUG: Failed to add layer from bytes: {e}")
+            return None
+        finally:
+            if loaded:
+                loaded.delete()
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
     def _add_layer_from_data(self, image, image_data):
         """Add image from raw data as a new layer"""
         try:
@@ -4925,10 +5408,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # Add the layer to the image
                 image.insert_layer(new_layer, None, 0)
 
+                # Generated sizes rarely match the canvas, so scale to cover it
+                self._fit_generated_layer(image, new_layer)
+
                 # Clean up
                 loaded_image.delete()
 
-                print("DEBUG: Successfully added GPT-Image-1 layer")
+                print("DEBUG: Successfully added generated layer")
                 return True
 
             finally:
@@ -4977,10 +5463,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # Add the layer to the image
                 image.insert_layer(new_layer, None, 0)
 
+                # Generated sizes rarely match the canvas, so scale to cover it
+                self._fit_generated_layer(image, new_layer)
+
                 # Clean up
                 loaded_image.delete()
 
-                print("DEBUG: Successfully added GPT-Image-1 layer")
+                print("DEBUG: Successfully added generated layer")
                 return True
 
             finally:
@@ -5001,7 +5490,8 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         # Show prompt dialog with API key checking (no mode selection for image generator)
         dialog_result = self._show_prompt_dialog(
-            "Image Generator", "", show_mode_selection=False
+            "Image Generator", "", show_mode_selection=False,
+            provider=self._get_provider(),
         )
         if not dialog_result:
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
@@ -5012,14 +5502,27 @@ class GimpAIPlugin(Gimp.PlugIn):
         )
 
         try:
-            # Get API key (should be available since dialog handles API key checking)
-            api_key = self._get_api_key()
-            if not api_key:
-                self._update_progress(progress_label, "❌ API key not available")
-                Gimp.message("❌ API key not available")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
-                )
+            # Credentials for whichever provider is configured
+            provider = self._get_provider()
+            api_key = None
+            if provider == "bedrock":
+                self._log_bedrock_environment()
+                try:
+                    bedrock_client.generation_credentials(self.config.get("bedrock", {}))
+                except bedrock_client.BedrockError as e:
+                    self._update_progress(progress_label, "❌ No AWS credentials found!")
+                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+                    )
+            else:
+                api_key = self._get_api_key()
+                if not api_key:
+                    self._update_progress(progress_label, "❌ API key not available")
+                    Gimp.message("❌ API key not available")
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+                    )
 
             # Update dialog immediately when processing starts
             self._update_progress(progress_label, "🎨 Generating image with AI...")
@@ -5027,8 +5530,12 @@ class GimpAIPlugin(Gimp.PlugIn):
             # Use threaded generation to keep UI responsive like other functions
             self._update_progress(progress_label, "🚀 Starting image generation...")
 
-            success, message, image_data = self._call_openai_generation_threaded(
-                prompt, api_key, size="auto", progress_label=progress_label
+            success, message, image_data = self._call_generation_threaded(
+                prompt,
+                api_key,
+                image.get_width(),
+                image.get_height(),
+                progress_label=progress_label,
             )
             if success and image_data:
                 # Create layer from the generated image data

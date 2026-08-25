@@ -1,20 +1,24 @@
 # Amazon Bedrock provider support
 
-Record of the changes that added Amazon Bedrock as an alternative provider for
-inpainting and layer compositing in this fork, added an object-removal feature
-built on it, the bugs found along the way, and how each piece was verified.
+Record of the changes that added Amazon Bedrock as an alternative provider to
+this fork, the two new features built on it, the bugs found along the way, and
+how each piece was verified.
 
 Fork of [lukaso/gimp-ai](https://github.com/lukaso/gimp-ai), branched from
 `436c37e` ("Remove version number from Readme", v0.14.0).
 
 ## Summary
 
-**AI Inpainting** and **AI Layer Composite** can now run through Amazon Bedrock
-instead of OpenAI, and a new **AI Erase Object** procedure removes a selected
-object and fills the gap from its surroundings, offering three alternatives to
-choose from. The provider is chosen in `Filters → AI → Settings`. Image
-generation remains OpenAI-only, since it needs a text-to-image model rather than
-an inpainting one.
+`Filters → AI` now has five entries. The provider is chosen once in
+`Filters → AI → Settings` and applies throughout.
+
+| Feature | OpenAI | Bedrock | Notes |
+|---|---|---|---|
+| Inpainting | yes | yes | |
+| Layer Composite | yes | yes | Bedrock flattens the layers first - see [Layer composite](#layer-composite) |
+| Image Generator | yes | yes | Bedrock generation runs in its own region - see [Generation](#generation) |
+| **Erase Object** | — | yes | New. Three alternative erasures per run |
+| **Generative Upscale** | — | yes | New. Fast, Conservative or Creative |
 
 Erase Object is the feature this fork was actually built for - removing
 photobombers - and it needed considerably more than a provider swap. See
@@ -23,6 +27,13 @@ photobombers - and it needed considerably more than a provider swap. See
 Eight bugs were found and fixed while building this. Four of them broke the
 OpenAI path as well and had nothing to do with Bedrock - including one that
 meant AI results were never actually placed into the image at all.
+
+The recurring theme, and the reason this document records measurements rather
+than intentions: most of what broke was invisible to inspection and only showed
+up when something was actually run and counted. A mask that looked right had
+zero selection pixels in it; a compositing call that reported success placed
+nothing; a request that worked on a small test image exceeded a payload cap on a
+real one.
 
 ## Model choice
 
@@ -34,9 +45,25 @@ Stable Diffusion 3.5 Large is available but is text-to-image and image-to-image
 only. Its API takes `prompt`, `image` and `strength`, with no mask parameter, so
 it cannot do masked inpainting.
 
-The model used is therefore `stability.stable-image-inpaint-v1:0`, Stability's
-current inpainting model on Bedrock, which takes an image plus a mask. It is
-configurable in Settings if you want to point at something else.
+The model used for inpainting is therefore `stability.stable-image-inpaint-v1:0`,
+Stability's current inpainting model on Bedrock, which takes an image plus a
+mask. It is configurable in Settings if you want to point at something else.
+
+### Models used
+
+| Purpose | Model | Region | Inference profile |
+|---|---|---|---|
+| Inpainting | `stability.stable-image-inpaint-v1:0` | config `region` | required |
+| Erase Object | `stability.stable-image-erase-object-v1:0` | config `region` | required |
+| Upscale (fast) | `stability.stable-fast-upscale-v1:0` | config `region` | required |
+| Upscale (conservative) | `stability.stable-conservative-upscale-v1:0` | config `region` | required |
+| Upscale (creative) | `stability.stable-creative-upscale-v1:0` | config `region` | required |
+| Generation | `stability.sd3-5-large-v1:0` | `generation_region`, default `us-west-2` | **must not have one** |
+
+The inference-profile column is the trap. Every editing model is rejected
+without the geography prefix (`us.`, `eu.`, `apac.`) and the generation model is
+rejected *with* it, so `resolve_credentials()` takes a `use_inference_profile`
+flag rather than applying one rule everywhere.
 
 ## Files
 
@@ -44,10 +71,13 @@ configurable in Settings if you want to point at something else.
 
 | File | Lines | Purpose |
 |---|---|---|
-| `bedrock_client.py` | 363 | SigV4 signing, credential resolution, request building. No GIMP dependencies, standard library only. |
+| `bedrock_client.py` | 545 | SigV4 signing, credential resolution, request building. No GIMP dependencies, standard library only. |
 | `tests/test_gimp_pipeline.py` | 239 | Mask and layer-flattening tests that run inside headless GIMP. |
 | `tests/test_native_context.py` | 90 | Native-resolution context window, pure and offline. |
 | `tests/test_erase_in_gimp.py` | 199 | Full erase path against a real photo, including the procedure itself (makes live calls). |
+| `tests/test_generate_in_gimp.py` | 100 | Text-to-image end to end (makes a live call). |
+| `tests/test_fit_in_gimp.py` | 109 | Generated-layer canvas fitting, no API calls. |
+| `tests/test_upscale_in_gimp.py` | 144 | Upscale variants and dialog construction (live calls optional). |
 | `tests/probe_placement.py` | 95 | Compares layer placement methods; found the Gegl no-op. |
 | `BEDROCK.md` | — | This document. |
 
@@ -107,6 +137,95 @@ These were each found by getting a 4xx from Bedrock, not from the documentation:
    geography prefix (`us.`, `eu.`, `apac.`). `inference_profile_id()` adds this
    automatically based on region, and leaves already-prefixed ids and ARNs alone.
 
+## Generation
+
+Text-to-image uses `stability.sd3-5-large-v1:0`, and differs from every other
+Bedrock path here in two ways that both cause hard failures if ignored:
+
+1. **Different region.** Stability's generation models are not offered in
+   `us-east-1`, where all the editing models live. Confirmed by listing:
+   us-east-1 has only `amazon.nova-canvas-v1:0`, and that is `LEGACY`.
+   us-west-2 has `sd3-5-large`, `stable-image-core` and `stable-image-ultra`,
+   all `ACTIVE`. Generation therefore has its own `generation_region`, default
+   `us-west-2`. No extra setup is needed for the second region: Bedrock serves
+   these models on demand, so there is no per-region model-access request, and
+   the generation call succeeded in us-west-2 on an account that had only ever
+   been used in us-east-1.
+2. **No inference profile.** The editing models must be invoked through a
+   geography-prefixed profile; generation must not be. Measured directly:
+
+   | Model id | Result |
+   |---|---|
+   | `stability.sd3-5-large-v1:0` | works, returned 1216x832 |
+   | `us.stability.sd3-5-large-v1:0` | `400 The provided model identifier is invalid` |
+
+   `resolve_credentials()` grew a `use_inference_profile` flag for this, and
+   `generation_credentials()` passes it as False.
+
+Generation also takes an **aspect ratio**, not pixel dimensions, from a fixed
+list (21:9 through 9:21), and returns roughly a megapixel at that ratio.
+`aspect_ratio_for()` maps the canvas shape to the nearest one on the list. Note
+that 4:3 is not on it, so a 2048x1536 canvas maps to 5:4 rather than 3:2 - 1.25
+is closer to 1.333 than 1.5 is.
+
+### Fitting the result to the canvas
+
+Generation ignores the selection and always produces a whole-canvas layer;
+generating into a selection is what Inpainting already does.
+
+Models return their own resolution, which rarely matches the canvas, and the
+layer used to be inserted at that size at (0,0) - leaving a visible gap. It is
+now scaled to **cover** the canvas and centred, so the tighter axis matches
+exactly and the other overhangs and can be cropped.
+
+GIMP 3 has no Lanczos filter. `InterpolationType` is `none, linear, cubic,
+nohalo, lohalo` - Lanczos was removed after 2.8. NoHalo is the intended
+enlarging filter and LoHalo the reducing one, so `_fit_generated_layer()`
+picks between them by direction of scale.
+
+Worth noting how large the enlargement can get: a 2048x1536 canvas maps to a
+5:4 aspect, generates at 1216x832, and is then enlarged 1.85x to 2245x1536. That
+is the case where a generative upscale would earn its place - see below.
+
+## Generative Upscale
+
+`Filters → AI → Generative Upscale` enlarges the **active layer** (not the whole
+image) using one of Stability's three upscale models, chosen from a dropdown.
+
+Measured on a 2048x1536 photo:
+
+| Variant | Input sent | Output | Factor | Time | Payload |
+|---|---|---|---|---|---|
+| fast | 1182x886 (reduced) | 4728x3544 | 4.0x | 6.1s | 4.5MB |
+| conservative | 2048x1536 | 3592x2696 | 1.8x | 32.2s | 2.2MB |
+| creative | 2048x1536 | 3632x2728 | 1.8x | 68.1s | 2.1MB |
+
+Fast is a strict 4x; the other two target about 4K regardless of input. So Fast
+yields the largest image but only after its input has been reduced, while the
+other two work from the full-resolution layer.
+
+### Four things the API enforced
+
+None of these are in the documentation; each came from a 400:
+
+1. **Fast accepts `image` and `output_format` only.** Anything else, `seed`
+   included, fails with `Invalid field 'seed' in request. Available fields for
+   upscale-fast are: image, output_format`.
+2. **Fast caps each side at 1536px** (`Image width must be at most 1536, but is
+   1600`), so larger layers are reduced with LoHalo before sending.
+3. **Conservative and Creative require a non-empty prompt** - `prompt must be at
+   least 1 character`. A neutral default is substituted when the user leaves the
+   box empty, rather than letting the call fail.
+4. **PNG responses exceed Bedrock's 16MB payload cap at these sizes.** All three
+   variants therefore request WebP. Fast is the trap here: a small test input
+   returned PNG fine, and only a realistic one blew the limit at 4728x3544
+   (38,849,158 bytes). GIMP loads WebP through its bundled `file-webp` plug-in.
+
+The documented input limits are also wrong in one place: the prose says
+Conservative takes "images between 64x64 and 1 megapixel", but it accepted a
+3.1MP layer without complaint. The 9,437,184 pixel figure in the parameter list
+is the real ceiling.
+
 ## `gimp-ai-plugin.py`
 
 ### Added
@@ -118,14 +237,21 @@ These were each found by getting a 4xx from Bedrock, not from the documentation:
 | `_credentials_ready` | 258 | Single credential gate for both providers |
 | `_log_bedrock_environment` | 277 | Prints what the plugin can see; masks secret values |
 | `_on_clear_bedrock_credentials` | 1360 | Removes stored AWS credentials |
-| `_flatten_layers_for_bedrock` | 2147 | Composites selected layers into one image for Bedrock |
-| `_convert_mask_to_bedrock` | 3373 | Converts mask polarity between providers |
-| `_call_bedrock_edit` | 3429 | Bedrock InvokeModel call |
-| `_calculate_native_context_extraction` | 3517 | Native-resolution context window |
-| `_call_bedrock_erase` | 3553 | Object-erase model call |
-| `_call_erase_variations_threaded` | 3604 | Runs the variations concurrently |
-| `_call_edit_threaded` | 3658 | Dispatches to the configured provider |
-| `run_erase_object` | 4041 | The Erase Object procedure |
+| `_flatten_layers_for_bedrock` | 2411 | Composites selected layers into one image for Bedrock |
+| `_convert_mask_to_bedrock` | 3637 | Converts mask polarity between providers |
+| `_call_bedrock_edit` | 3693 | Bedrock InvokeModel call |
+| `_calculate_native_context_extraction` | 3781 | Native-resolution context window |
+| `_call_bedrock_erase` | 3817 | Object-erase model call |
+| `_call_erase_variations_threaded` | 3868 | Runs the variations concurrently |
+| `_call_edit_threaded` | 3922 | Dispatches to the configured provider |
+| `run_erase_object` | 4432 | The Erase Object procedure |
+| `run_upscale` | 4314 | The Generative Upscale procedure |
+| `_show_upscale_dialog` | 1942 | Variant dropdown and prompt |
+| `_call_bedrock_upscale` | 2040 | Upscale model call |
+| `_export_layer_for_upscale` | 2092 | Exports the active layer, reduced to fit input limits |
+| `_add_layer_from_bytes` | 5338 | Adds WebP/JPEG results without canvas fitting |
+| `_call_bedrock_generation` | 2132 | Text-to-image call |
+| `_call_generation_threaded` | 2259 | Dispatches generation to the configured provider |
 
 `_call_bedrock_edit` returns the same `{"data": [{"b64_json": ...}]}` shape the
 OpenAI path returns, so the entire compositing pipeline is provider-agnostic and
@@ -378,6 +504,20 @@ What was actually run, as opposed to reasoned about:
   unreadable, that `AWS_*` environment variables pass through, that
   `bedrock_client` imports under GIMP's Python 3.12.3, and that TLS to
   `bedrock-runtime` connects.
+- **`tests/test_generate_in_gimp.py`** — generation end to end in GIMP: the
+  model id is unprefixed, the canvas maps to the right aspect ratio, the call
+  returns PNG data, and it lands as a layer. Ran against a real prompt and
+  produced a correct 1344x768 landscape image for a 1600x900 canvas.
+- **`tests/test_upscale_in_gimp.py`** — all three variants against a real photo:
+  input respects each variant's limits, the call succeeds, the response is under
+  the payload cap, GIMP loads the WebP, and the result is larger with the aspect
+  ratio preserved. It also builds the upscale dialog and dismisses it on a timer,
+  with no API calls - that check exists because a helper returning a tuple and
+  being unpacked as a single widget has already shipped once.
+- **`tests/test_fit_in_gimp.py`** — 25 checks over five canvas/generation size
+  combinations (enlarge, reduce, portrait, exact match): the layer covers the
+  canvas, one axis matches exactly, aspect ratio is preserved, and it is centred
+  with no gap. No API calls, so it is cheap to run.
 - **`tests/test_native_context.py`** — 17 checks on the context window: never
   upscales, stays inside the image for edge and corner selections, scales
   oversized windows down to about the target area, keeps the aspect ratio within
@@ -456,9 +596,32 @@ batch run. It rebinds the plugin's methods onto a plain object: instantiating
 }
 ```
 
+| Key | Default | Applies to |
+|---|---|---|
+| `region` | `us-east-1` | inpaint, erase, upscale |
+| `model_id` | inpaint model | Inpainting |
+| `erase_model_id` | erase model | Erase Object |
+| `generation_region` | `us-west-2` | Image Generator |
+| `generation_model_id` | SD 3.5 Large | Image Generator |
+| `erase_variations` | 3 | Erase Object |
+| `grow_mask` | 5 | inpaint, erase |
+| `upscale_variant` | `conservative` | Generative Upscale |
+| `upscale_creativity` | 0.35 | Conservative and Creative upscale |
+| `seed`, `negative_prompt` | 0, empty | most models |
+| `api_key`, `access_key_id`, `secret_access_key`, `profile` | unset | credentials |
+
 `grow_mask` (0-20) expands and softens the mask edge; 5 measured better than 20,
 which grew far enough to swallow neighbouring subjects. `erase_variations` (1-4)
-is how many alternative erasures Erase Object produces.
+is how many alternative erasures Erase Object produces. `generation_region` and
+`generation_model_id` are separate because generation is not available in the
+region the editing models use.
+
+## Known dead code
+
+`_generate_gpt_image_layer_threaded` has no callers - the live generation path
+is `_call_openai_generation` via `_call_generation_threaded`. It was left in
+place rather than deleted, but it is not the function to edit when changing
+generation behaviour.
 
 Blank values fall through to the next credential source. The geography prefix is
 added to `model_id` automatically.
