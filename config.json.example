@@ -17,6 +17,7 @@
         "seed": 0,
         "grow_mask": 5,
         "erase_variations": 3,
+        "inpaint_variations": 3,
         "generation_region": "us-west-2",
         "generation_model_id": "stability.sd3-5-large-v1:0",
         "upscale_variant": "conservative",

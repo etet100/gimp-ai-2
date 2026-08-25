@@ -3690,7 +3690,8 @@ class GimpAIPlugin(Gimp.PlugIn):
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    def _call_bedrock_edit(self, image_data, mask_data, prompt, progress_label=None):
+    def _call_bedrock_edit(self, image_data, mask_data, prompt, progress_label=None,
+                           seed=None):
         """
         Call Amazon Bedrock (Stability inpainting) and return an OpenAI-shaped response.
 
@@ -3865,32 +3866,30 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"DEBUG: Bedrock erase failed: {e}")
             return False, f"Bedrock erase failed: {str(e)}", None
 
-    def _call_erase_variations_threaded(
-        self, image_data, mask_data, count, progress_label=None
-    ):
+    def _run_bedrock_variations(self, count, make_call, progress_label=None,
+                                name="Bedrock variations"):
         """
-        Produce `count` alternative erasures and return those that succeeded.
+        Produce `count` alternative results and return those that succeeded.
 
-        Each call uses its own random seed, which is what makes the results
-        differ. The calls run concurrently: they are network-bound and take
-        roughly 15 seconds each, so running them in sequence would triple the
-        wait for no benefit. A variation that fails (throttling, say) is dropped
-        and the rest are still used.
+        Each call gets its own random seed, which is what makes the results
+        differ. The calls run concurrently: they are network-bound at roughly 15
+        seconds each, so running them in sequence would multiply the wait for no
+        benefit. A variation that fails (throttling, say) is dropped and the rest
+        are still used.
+
+        make_call(seed) must return the usual (success, message, response).
         """
         import concurrent.futures
         import random
 
         seeds = [random.randint(1, 4294967294) for _ in range(count)]
-        print(f"DEBUG: Requesting {count} erase variations, seeds {seeds}")
+        print(f"DEBUG: Requesting {count} variations for {name}, seeds {seeds}")
 
         def operation():
             results = []
             errors = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-                futures = {
-                    pool.submit(self._call_bedrock_erase, image_data, mask_data, None, seed): seed
-                    for seed in seeds
-                }
+                futures = {pool.submit(make_call, seed): seed for seed in seeds}
                 for future in concurrent.futures.as_completed(futures):
                     seed = futures[future]
                     try:
@@ -3901,7 +3900,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         results.append((seed, response))
                     else:
                         errors.append(f"seed {seed}: {message}")
-                        print(f"DEBUG: Erase variation {seed} failed: {message}")
+                        print(f"DEBUG: Variation {seed} failed: {message}")
 
             if not results:
                 return {
@@ -3915,9 +3914,34 @@ class GimpAIPlugin(Gimp.PlugIn):
                 "data": results,
             }
 
-        return self._run_threaded_operation(
-            operation, "Bedrock erase API call", progress_label
-        )
+        return self._run_threaded_operation(operation, name, progress_label)
+
+    def _place_variation_layers(self, image, results, context_info, label):
+        """
+        Composite each variation as its own layer, newest at the bottom of the
+        batch so variation 1 ends on top, then name them and show only the first.
+        """
+        placed = 0
+        last_message = ""
+        for seed, response in reversed(results):
+            ok, last_message = self._download_and_composite_result(
+                image, response, context_info, "full"
+            )
+            if ok:
+                placed += 1
+                print(f"DEBUG: Placed {label} variation (seed {seed})")
+            else:
+                print(f"DEBUG: Failed to place variation {seed}: {last_message}")
+
+        for index, layer in enumerate(image.get_layers()[:placed], start=1):
+            layer.set_name(
+                f"AI {label} Result" if placed == 1
+                else f"AI {label} {index} of {placed}"
+            )
+            layer.set_visible(index == 1)
+        if placed:
+            Gimp.displays_flush()
+        return placed, last_message
 
     def _call_edit_threaded(
         self,
@@ -4503,8 +4527,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             self._update_progress(
                 progress_label, f"🚀 Erasing ({variations} variations)..."
             )
-            api_success, api_message, results = self._call_erase_variations_threaded(
-                image_data, mask_data, variations, progress_label
+            api_success, api_message, results = self._run_bedrock_variations(
+                variations,
+                lambda seed: self._call_bedrock_erase(image_data, mask_data, None, seed),
+                progress_label,
+                name="Bedrock erase API call",
             )
 
             if not api_success:
@@ -4524,32 +4551,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             # changed (measured: ~3% of pixels) and has already blended across
             # the mask edge, so re-masking to the selection rectangle would
             # discard that blending and leave a visible rectangular seam.
-            #
-            # Composited in reverse so the first variation ends up on top: each
-            # result is inserted at the top of the stack.
-            placed = 0
-            last_message = ""
-            for seed, response in reversed(results):
-                ok, last_message = self._download_and_composite_result(
-                    image, response, context_info, "full"
-                )
-                if ok:
-                    placed += 1
-                    print(f"DEBUG: Placed erase variation (seed {seed})")
-                else:
-                    print(f"DEBUG: Failed to place variation {seed}: {last_message}")
+            placed, last_message = self._place_variation_layers(
+                image, results, context_info, "Erase"
+            )
 
             if placed:
-                # Name them top-down and show only the first, so the user can
-                # step through the alternatives by toggling layer visibility.
-                for index, layer in enumerate(image.get_layers()[:placed], start=1):
-                    layer.set_name(
-                        "AI Erase Result" if placed == 1
-                        else f"AI Erase {index} of {placed}"
-                    )
-                    layer.set_visible(index == 1)
-                Gimp.displays_flush()
-
                 self._update_progress(
                     progress_label,
                     "✅ Object erased!" if placed == 1
@@ -4659,6 +4665,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             if mode == "full_image":
                 print("DEBUG: Calculating full-image context extraction...")
                 context_info = self._calculate_full_image_context_extraction(image)
+            elif mode == "contextual" and provider == "bedrock":
+                # Native resolution, so the window round-trips without
+                # resampling and can be pasted back whole
+                print("DEBUG: Calculating native-resolution context extraction...")
+                context_info = self._calculate_native_context_extraction(image)
             elif mode == "contextual":
                 print("DEBUG: Calculating contextual selection-based extraction...")
                 context_info = self._calculate_context_extraction(image)
@@ -4729,26 +4740,93 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             print(f"DEBUG: Using OpenAI API size: {api_size}")
 
-            api_success, api_message, api_response = self._call_edit_threaded(
-                image_data,
-                mask_data,
-                prompt,
-                api_key,
-                size=api_size,
-                progress_label=progress_label,
-            )
+            if provider == "bedrock":
+                # Bedrock returns the context window with only the masked region
+                # changed, so several seeds give genuine alternatives and the
+                # whole window can be pasted back without a seam. The OpenAI
+                # edits endpoint regenerates the whole window instead, so it
+                # keeps the single call and the selection-shaped layer mask.
+                variations = self.config.get("bedrock", {}).get("inpaint_variations", 3)
+                variations = max(1, min(4, int(variations)))
+                self._update_progress(
+                    progress_label, f"🚀 Inpainting ({variations} variations)..."
+                )
+                api_success, api_message, results = self._run_bedrock_variations(
+                    variations,
+                    lambda seed: self._call_bedrock_edit(
+                        image_data, mask_data, prompt, None, seed
+                    ),
+                    progress_label,
+                    name="Bedrock inpaint API call",
+                )
+            else:
+                api_success, api_message, api_response = self._call_edit_threaded(
+                    image_data,
+                    mask_data,
+                    prompt,
+                    api_key,
+                    size=api_size,
+                    progress_label=progress_label,
+                )
+                results = [(0, api_response)] if api_success else None
 
             if api_success:
                 print(f"DEBUG: AI API succeeded: {api_message}")
                 self._update_progress(progress_label, "Processing AI response...")
 
-                # Download and composite result with proper masking
-                import_success, import_message = self._download_and_composite_result(
-                    image, api_response, context_info, mode, color_info
+                # Pasting the whole window replaces the unmasked ring around the
+                # selection too, which is only harmless when that ring comes back
+                # unresampled. Full-image mode scales the whole canvas down to
+                # reach the API, so it keeps the selection mask.
+                scale = context_info.get("padding_info", {}).get("scale_factor", 1.0)
+                whole_window = provider == "bedrock" and abs(scale - 1.0) < 0.005
+                print(
+                    f"DEBUG: Composite scale {scale:.3f} -> "
+                    f"{'whole window' if whole_window else 'masked to selection'}"
                 )
 
+                if whole_window:
+                    placed, import_message = self._place_variation_layers(
+                        image, results, context_info, "Inpaint"
+                    )
+                    import_success = placed > 0
+                    if import_success:
+                        self._update_progress(
+                            progress_label,
+                            "✅ AI Inpaint Complete!" if placed == 1
+                            else f"✅ {placed} variations - toggle layer visibility to compare",
+                        )
+                elif provider == "bedrock":
+                    # Resampled window: mask each variation to the selection
+                    placed = 0
+                    for seed, response in reversed(results):
+                        ok_one, import_message = self._download_and_composite_result(
+                            image, response, context_info, mode, color_info
+                        )
+                        placed += 1 if ok_one else 0
+                    for index, layer in enumerate(image.get_layers()[:placed], start=1):
+                        layer.set_name(
+                            "AI Inpaint Result" if placed == 1
+                            else f"AI Inpaint {index} of {placed}"
+                        )
+                        layer.set_visible(index == 1)
+                    import_success = placed > 0
+                    if import_success:
+                        self._update_progress(
+                            progress_label,
+                            "✅ AI Inpaint Complete!" if placed == 1
+                            else f"✅ {placed} variations - toggle layer visibility to compare",
+                        )
+                else:
+                    # Masked to the selection: the OpenAI model alters pixels
+                    # outside it, and only the mask keeps those out of the result
+                    import_success, import_message = self._download_and_composite_result(
+                        image, api_response, context_info, mode, color_info
+                    )
+                    if import_success:
+                        self._update_progress(progress_label, "✅ AI Inpaint Complete!")
+
                 if import_success:
-                    self._update_progress(progress_label, "✅ AI Inpaint Complete!")
                     print(f"DEBUG: AI Inpaint Complete - {import_message}")
                 else:
                     self._update_progress(

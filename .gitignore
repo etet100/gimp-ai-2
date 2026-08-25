@@ -16,3 +16,5 @@ tests/generate_test_result.txt
 tests/*.log
 tests/fit_test_result.txt
 tests/upscale_test_result.txt
+tests/inpaint_test_result.txt
+tests/inpaint_variation_*.png

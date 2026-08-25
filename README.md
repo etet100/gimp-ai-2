@@ -111,18 +111,32 @@ first, so this is just credentials and a region.
 > launch GIMP from a terminal with `AWS_ACCESS_KEY_ID` and
 > `AWS_SECRET_ACCESS_KEY` exported.
 
-The default model is `stability.stable-image-inpaint-v1:0`, invoked through the
-cross-region inference profile for your region (`us.`, `eu.` or `apac.`), which
-the plugin adds automatically. Stability's older SDXL 1.0 model
-(`stability.stable-diffusion-xl-v1`) is no longer offered on Bedrock.
+#### Which model each feature uses
 
-Bedrock serves **AI Inpainting**, **AI Layer Composite**, **AI Erase Object**,
-**AI Generative Upscale** and **AI Image Generator**.
+| Menu item | Model | Region | Override key |
+|---|---|---|---|
+| Inpainting | `stability.stable-image-inpaint-v1:0` | `region` | `model_id` |
+| Layer Composite | `stability.stable-image-inpaint-v1:0` | `region` | `model_id` |
+| Erase Object | `stability.stable-image-erase-object-v1:0` | `region` | `erase_model_id` |
+| Generative Upscale - Fast | `stability.stable-fast-upscale-v1:0` | `region` | — |
+| Generative Upscale - Conservative | `stability.stable-conservative-upscale-v1:0` | `region` | — |
+| Generative Upscale - Creative | `stability.stable-creative-upscale-v1:0` | `region` | — |
+| Image Generator | `stability.sd3-5-large-v1:0` | `generation_region` (`us-west-2`) | `generation_model_id` |
 
-> **Generation uses a different region.** Stability's text-to-image models are
-> not offered in `us-east-1`, where the editing models live, so generation has
-> its own `generation_region` setting (default `us-west-2`). No extra setup is
-> needed for it - the same credentials work in both regions.
+Everything except Image Generator runs in the region you set in Settings
+(default `us-east-1`). Generation is separate because Stability's text-to-image
+models are not offered there; the same credentials work in both regions and
+there is nothing extra to enable.
+
+Every model above **except generation** is invoked through the cross-region
+inference profile for your region, so the plugin prefixes the id with `us.`,
+`eu.` or `apac.` automatically - `us.stability.stable-image-inpaint-v1:0` and so
+on. Generation is invoked on-demand and rejects a prefixed id, so it is sent
+bare. You do not need to do anything about this; it is only worth knowing if you
+override a model id and get "The provided model identifier is invalid."
+
+Stability's older SDXL 1.0 model (`stability.stable-diffusion-xl-v1`) is no
+longer offered on Bedrock, which is why none of these use it.
 
 Layer composite behaves differently on the two providers. OpenAI receives each
 selected layer as a separate image and can use one as a reference for another.
