@@ -16,7 +16,7 @@ This guide will walk you through installing the GIMP AI Plugin, even if you've n
 Before starting, make sure you have:
 
 1. ✅ **GIMP 3.0.4 or newer** installed (download from [gimp.org](https://www.gimp.org))
-2. ✅ **An OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)) **or AWS credentials with Amazon Bedrock access** - Erase Object and Generative Upscale need Bedrock
+2. ✅ **An OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)) **or AWS credentials with Amazon Bedrock access** - Generative Upscale needs Bedrock
 3. ✅ **Internet connection** for downloading files and using AI features
 
 > **Important**: This plugin requires **GIMP 3.0.4 or newer**. Earlier versions are not compatible. The automated installer will detect all compatible GIMP versions and let you choose which to install to.
@@ -306,7 +306,7 @@ Let's verify everything is working:
 2. **Look for the AI menu**: `Filters` → `AI`
 3. You should see these options:
    - 🎨 **Inpainting** - Fill areas with AI-generated content
-   - 🧹 **Erase Object** - Remove a selected object (Amazon Bedrock only)
+   - 🧹 **Erase Object** - Remove a selected object (best with Amazon Bedrock)
    - 🔍 **Generative Upscale** - Enlarge a layer with AI (Amazon Bedrock only)
    - 🖼️ **Generate Layer** - Create a new layer from text
    - 🆕 **Generate New Image** - Create a new image from text (also in `File` → `Create`)

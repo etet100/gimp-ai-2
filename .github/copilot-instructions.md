@@ -8,7 +8,7 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ### Key Features
 - **AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
-- **AI Erase Object**: Remove a selected object and fill from surrounding context; three variations per run (Bedrock only)
+- **AI Erase Object**: Remove a selected object and fill from surrounding context; three variations per run on Bedrock; on OpenAI an approximation via prompted inpainting
 - **AI Generative Upscale**: Enlarge the active layer with Stability's upscale models (Bedrock only)
 - **AI Image Generation**: Create images from text, as a new layer (Generate Layer) or a new image (Generate New Image); OpenAI can also take reference images
 - **AI Layer Composite**: Intelligently blend AI content into existing images

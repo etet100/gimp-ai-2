@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Erase Object on OpenAI**: no longer Bedrock-only. With the OpenAI provider
+  it runs prompted inpainting with a fixed removal prompt (no new objects, text
+  or people), the selection grown by `openai.erase_grow_mask` (default 8px) so
+  edges and halos go too, and the result masked back to the grown selection
+  with a feathered edge, since the OpenAI model redraws the whole window.
+  `openai.erase_variations` (1-4, default 1) sets how many alternatives are
+  made. Stability's dedicated erase model on Bedrock is still the recommended
+  option: a generative model can still invent something in the gap
+
+### Fixed
+- Erase Object, Inpainting and Layer Composite ran with no selection at all,
+  treating the whole image as selected - Erase Object then erased everything
+  in the context window. The selection checks read the first value of
+  `Gimp.Selection.bounds()`, which only says the call succeeded; whether
+  anything is selected is the second. They now go through `_has_selection()`
+
 ### Changed
 - Documentation moved to a GitHub Pages site built from `docs/`
   (https://etet100.github.io/gimp-ai-2/). The README is now a short overview

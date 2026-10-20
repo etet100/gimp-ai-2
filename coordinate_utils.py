@@ -9,24 +9,24 @@ All coordinate calculations for context extraction, masking, and placement are h
 def get_optimal_openai_shape(width, height):
     """
     Select optimal OpenAI shape based on image dimensions.
-    
+
     Args:
         width: Image width in pixels
         height: Image height in pixels
-        
+
     Returns:
         tuple: (target_width, target_height) - one of (1024, 1024), (1536, 1024), (1024, 1536)
     """
     if width <= 0 or height <= 0:
         return (1024, 1024)  # Default to square for invalid dimensions
-        
+
     aspect_ratio = width / height
-    
+
     if aspect_ratio > 1.3:
         # Landscape orientation
         return (1536, 1024)
     elif aspect_ratio < 0.77:
-        # Portrait orientation  
+        # Portrait orientation
         return (1024, 1536)
     else:
         # Square or near-square
@@ -115,13 +115,13 @@ def get_gpt_image_shape(width, height, max_pixels=GPT_IMAGE_MAX_PIXELS):
 def calculate_padding_for_shape(current_width, current_height, target_width, target_height):
     """
     Calculate padding needed to fit content into target OpenAI shape.
-    
+
     Args:
         current_width: Current content width
         current_height: Current content height
         target_width: Target width (1024 or 1536)
         target_height: Target height (1024 or 1536)
-        
+
     Returns:
         dict: {
             'scale_factor': Applied scaling factor,
@@ -133,17 +133,17 @@ def calculate_padding_for_shape(current_width, current_height, target_width, tar
     scale_x = target_width / current_width
     scale_y = target_height / current_height
     scale = min(scale_x, scale_y)
-    
+
     # Scale dimensions
     scaled_width = int(current_width * scale)
     scaled_height = int(current_height * scale)
-    
+
     # Calculate padding to center
     pad_left = (target_width - scaled_width) // 2
     pad_top = (target_height - scaled_height) // 2
     pad_right = target_width - scaled_width - pad_left
     pad_bottom = target_height - scaled_height - pad_top
-    
+
     return {
         'scale_factor': scale,
         'scaled_size': (scaled_width, scaled_height),
@@ -151,18 +151,18 @@ def calculate_padding_for_shape(current_width, current_height, target_width, tar
     }
 
 
-def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2, sel_y2, 
+def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2, sel_y2,
                                   mode='focused', has_selection=True):
     """
     Extract context region around selection for inpainting with optimal shape.
-    
+
     Args:
         img_width: Source image width
         img_height: Source image height
         sel_x1, sel_y1, sel_x2, sel_y2: Selection bounds
         mode: 'focused' for partial extraction, 'full' for whole image
         has_selection: Whether there's an active selection
-        
+
     Returns:
         dict: Context extraction parameters with optimal shape
     """
@@ -175,14 +175,14 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
         sel_y1 = (img_height - size) // 2
         sel_x2 = sel_x1 + size
         sel_y2 = sel_y1 + size
-        
+
     sel_width = sel_x2 - sel_x1
     sel_height = sel_y2 - sel_y1
-    
+
     if mode == 'full':
         # Send entire image with mask
         target_shape = get_optimal_openai_shape(img_width, img_height)
-        padding_info = calculate_padding_for_shape(img_width, img_height, 
+        padding_info = calculate_padding_for_shape(img_width, img_height,
                                                   target_shape[0], target_shape[1])
         return {
             'mode': 'full',
@@ -193,17 +193,17 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
             'padding_info': padding_info,
             'has_selection': has_selection
         }
-    
+
     # Focused mode: extract region around selection
     # Calculate context padding (30-50% of selection, min 50px, max 300px)
     context_pad = max(50, min(300, int(max(sel_width, sel_height) * 0.4)))
-    
+
     # Initial context bounds
     ctx_x1 = sel_x1 - context_pad
     ctx_y1 = sel_y1 - context_pad
     ctx_x2 = sel_x2 + context_pad
     ctx_y2 = sel_y2 + context_pad
-    
+
     # Smart boundary handling: prefer not to extend beyond image
     if ctx_x1 < 0:
         shift = -ctx_x1
@@ -221,15 +221,15 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
         shift = ctx_y2 - img_height
         ctx_y2 = img_height
         ctx_y1 = max(0, ctx_y1 - shift)
-    
+
     ctx_width = ctx_x2 - ctx_x1
     ctx_height = ctx_y2 - ctx_y1
-    
+
     # Determine optimal shape for context
     target_shape = get_optimal_openai_shape(ctx_width, ctx_height)
     target_aspect = target_shape[0] / target_shape[1]
     current_aspect = ctx_width / ctx_height if ctx_height > 0 else 1.0
-    
+
     # Try to extend extract region to match target aspect ratio
     # This avoids padding when possible by using more of the available image
     if abs(current_aspect - target_aspect) > 0.01:  # Only if aspect ratios differ significantly
@@ -237,38 +237,38 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
             # Need wider region: extend horizontally if possible
             target_width = int(ctx_height * target_aspect)
             width_diff = target_width - ctx_width
-            
+
             # Try to extend equally on both sides
             left_extend = width_diff // 2
             right_extend = width_diff - left_extend
-            
+
             new_ctx_x1 = max(0, ctx_x1 - left_extend)
             new_ctx_x2 = min(img_width, ctx_x2 + right_extend)
-            
+
             # If we hit boundaries, try to extend more on the available side
             if new_ctx_x1 == 0 and new_ctx_x2 < img_width:
                 # Hit left boundary, extend right more
                 remaining = target_width - (new_ctx_x2 - new_ctx_x1)
                 new_ctx_x2 = min(img_width, new_ctx_x2 + remaining)
             elif new_ctx_x2 == img_width and new_ctx_x1 > 0:
-                # Hit right boundary, extend left more  
+                # Hit right boundary, extend left more
                 remaining = target_width - (new_ctx_x2 - new_ctx_x1)
                 new_ctx_x1 = max(0, new_ctx_x1 - remaining)
-                
+
             ctx_x1, ctx_x2 = new_ctx_x1, new_ctx_x2
-            
+
         else:
             # Need taller region: extend vertically if possible
             target_height = int(ctx_width / target_aspect)
             height_diff = target_height - ctx_height
-            
+
             # Try to extend equally on both sides
             top_extend = height_diff // 2
             bottom_extend = height_diff - top_extend
-            
+
             new_ctx_y1 = max(0, ctx_y1 - top_extend)
             new_ctx_y2 = min(img_height, ctx_y2 + bottom_extend)
-            
+
             # If we hit boundaries, try to extend more on the available side
             if new_ctx_y1 == 0 and new_ctx_y2 < img_height:
                 # Hit top boundary, extend bottom more
@@ -278,16 +278,16 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
                 # Hit bottom boundary, extend top more
                 remaining = target_height - (new_ctx_y2 - new_ctx_y1)
                 new_ctx_y1 = max(0, new_ctx_y1 - remaining)
-                
+
             ctx_y1, ctx_y2 = new_ctx_y1, new_ctx_y2
-    
+
     # Recalculate final dimensions
     ctx_width = ctx_x2 - ctx_x1
     ctx_height = ctx_y2 - ctx_y1
-    
+
     padding_info = calculate_padding_for_shape(ctx_width, ctx_height,
                                               target_shape[0], target_shape[1])
-    
+
     return {
         'mode': 'focused',
         'selection_bounds': (sel_x1, sel_y1, sel_x2, sel_y2),
@@ -308,12 +308,12 @@ def extract_context_with_selection(img_width, img_height, sel_x1, sel_y1, sel_x2
 def calculate_result_placement(result_shape, original_shape, context_info):
     """
     Calculate placement for AI result back into original image.
-    
+
     Args:
         result_shape: (width, height) of AI result
         original_shape: (width, height) of original image
         context_info: Context extraction info used for generation
-        
+
     Returns:
         dict: Placement parameters
     """
@@ -321,7 +321,7 @@ def calculate_result_placement(result_shape, original_shape, context_info):
         # Full image mode: scale entire result to original size
         scale_x = original_shape[0] / result_shape[0]
         scale_y = original_shape[1] / result_shape[1]
-        
+
         return {
             'placement_mode': 'replace',
             'scale': (scale_x, scale_y),
@@ -332,11 +332,11 @@ def calculate_result_placement(result_shape, original_shape, context_info):
         # Focused mode: scale and position extract region
         extract_region = context_info['extract_region']
         target_shape = context_info['target_shape']
-        
+
         # Calculate scale from result back to extract size
         scale_x = extract_region[2] / target_shape[0]
         scale_y = extract_region[3] / target_shape[1]
-        
+
         return {
             'placement_mode': 'composite',
             'scale': (scale_x, scale_y),
@@ -348,11 +348,11 @@ def calculate_result_placement(result_shape, original_shape, context_info):
 def calculate_scale_from_shape(source_shape, target_shape):
     """
     Calculate scaling factors between two shapes.
-    
+
     Args:
         source_shape: (width, height) tuple
         target_shape: (width, height) tuple
-        
+
     Returns:
         dict: {
             'scale_x': Horizontal scale factor,
@@ -362,7 +362,7 @@ def calculate_scale_from_shape(source_shape, target_shape):
     """
     scale_x = target_shape[0] / source_shape[0] if source_shape[0] > 0 else 1.0
     scale_y = target_shape[1] / source_shape[1] if source_shape[1] > 0 else 1.0
-    
+
     return {
         'scale_x': scale_x,
         'scale_y': scale_y,
@@ -432,18 +432,18 @@ def calculate_mask_coordinates(context_info, target_size):
 def calculate_placement_coordinates(context_info):
     """
     Calculate where to place the AI result back in the original image.
-    
+
     Args:
         context_info: Context extraction info from extract_context_with_selection()
-        
+
     Returns:
         dict with placement coordinates
     """
     ctx_x1, ctx_y1, ctx_width, ctx_height = context_info['extract_region']
-    
+
     return {
         'paste_x': ctx_x1,
-        'paste_y': ctx_y1, 
+        'paste_y': ctx_y1,
         'result_width': ctx_width,
         'result_height': ctx_height
     }
@@ -452,47 +452,47 @@ def calculate_placement_coordinates(context_info):
 def validate_context_info(context_info):
     """
     Validate that context_info contains all required fields with valid values.
-    
+
     Args:
         context_info: Context info dict to validate
-        
+
     Returns:
         tuple: (is_valid: bool, error_message: str)
     """
     required_fields = [
         'selection_bounds', 'extract_region', 'target_shape', 'has_selection'
     ]
-    
+
     for field in required_fields:
         if field not in context_info:
             return False, f"Missing required field: {field}"
-    
+
     # Validate selection bounds
     sel_bounds = context_info['selection_bounds']
     if len(sel_bounds) != 4:
         return False, "selection_bounds must have 4 values (x1, y1, x2, y2)"
-    
+
     sel_x1, sel_y1, sel_x2, sel_y2 = sel_bounds
     if sel_x2 <= sel_x1 or sel_y2 <= sel_y1:
         return False, "Invalid selection bounds: x2 <= x1 or y2 <= y1"
-    
+
     # Validate extract region
     extract_region = context_info['extract_region']
     if len(extract_region) != 4:
         return False, "extract_region must have 4 values (x1, y1, width, height)"
-    
+
     ext_x1, ext_y1, ext_width, ext_height = extract_region
     if ext_width <= 0 or ext_height <= 0:
         return False, "Extract region dimensions must be positive"
-    
+
     # Validate that extract region contains selection (for focused mode)
     if context_info.get('mode') == 'focused':
         ext_x2 = ext_x1 + ext_width
         ext_y2 = ext_y1 + ext_height
-        
+
         if not (ext_x1 <= sel_x1 and ext_y1 <= sel_y1 and ext_x2 >= sel_x2 and ext_y2 >= sel_y2):
             return False, "Extract region must contain the selection"
-    
+
     # Validate target shape
     target_shape = context_info['target_shape']
     if not isinstance(target_shape, tuple) or len(target_shape) != 2:
@@ -502,7 +502,7 @@ def validate_context_info(context_info):
         return False, (
             f"target_shape must be one of {valid_shapes} or a valid GPT-Image-2.x size"
         )
-    
+
     return True, ""
 
 
@@ -552,16 +552,16 @@ def check_coordinate_properties(img_width, img_height, sel_x1, sel_y1, sel_x2, s
             mask_coords['x1'] < mask_coords['x2'] and
             mask_coords['y1'] < mask_coords['y2']
         )
-    
+
     # Check that placement would cover selection
     paste_x, paste_y = placement['paste_x'], placement['paste_y']
     result_width, result_height = placement['result_width'], placement['result_height']
-    
+
     results['placement_covers_selection'] = (
         paste_x <= sel_x1 and paste_y <= sel_y1 and
         paste_x + result_width >= sel_x2 and paste_y + result_height >= sel_y2
     )
-    
+
     return results
 
 # Stability's image models work internally at roughly one megapixel. Sending

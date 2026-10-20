@@ -1,0 +1,10 @@
+{
+    "filewatcher.commands": [
+        {
+            "match": "[/\\\\](gimp-ai-plugin|coordinate_utils|bedrock_client)\\.py$",
+            "isAsync": true,
+            "cmd": "copy /Y \"${file}\" \"e:\\Programy\\GIMP\\lib\\gimp\\3.0\\plug-ins\\gimp-ai-plugin\\\"",
+            "event": "onFileChange"
+        }
+    ]
+}

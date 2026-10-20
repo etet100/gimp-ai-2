@@ -7,8 +7,9 @@ nav_order: 2
 # Erase Object
 
 **Remove an unwanted object and fill the gap from the surrounding image.**
-Requires Amazon Bedrock - it uses Stability's purpose-built object-erase model,
-which has no OpenAI equivalent.
+Works best with Amazon Bedrock, which has Stability's purpose-built
+object-erase model. With OpenAI it works too, as an approximation - see
+[With OpenAI](#with-openai).
 
 <!-- Screenshot: docs/assets/screenshots/erase-object.png -->
 
@@ -23,7 +24,7 @@ That is the whole workflow: no prompt, no options.
 Include a little of the object's shadow or contact points in the selection.
 A mask that stops exactly at the outline tends to leave a ghost behind.
 
-## Three alternatives
+## Three alternatives (Bedrock)
 
 You get **three alternative erasures** as three layers, named `AI Erase 1 of 3`
 through `3 of 3`, with only the first visible. Toggle layer visibility to compare
@@ -36,6 +37,25 @@ Set `erase_variations` in the `bedrock` section of `config.json` to change how
 many are generated (1-4). There is deliberately no prompt: removal is
 unambiguous, and describing it only invites the model to invent replacement
 content instead of removing.
+
+## With OpenAI
+
+OpenAI has no dedicated erase model, so with the OpenAI provider Erase Object
+is inpainting with a fixed prompt: remove the object and its shadow, rebuild
+only the background behind it, add nothing new. Still no prompt for you to
+write. What differs from Bedrock:
+
+- **It can invent things.** A generative model sometimes fills the gap with a
+  new object or text in spite of the prompt. Run it again, or switch to Bedrock
+- **The selection is grown first**, by 8px by default, so the object's edge
+  and halo go too. The OpenAI model redraws the whole window, so the result is
+  masked back to that grown selection with a feathered edge instead of pasted
+  whole
+- **One result per run** by default, because each one is a separate billed
+  request that can take a minute or more with the GPT-Image-2.5 models
+
+Set `erase_variations` (1-4) and `erase_grow_mask` (0-50) in the `openai`
+section of `config.json` to change these. See [Configuration](../configuration.md#openai).
 
 ## Why it beats prompted inpainting
 

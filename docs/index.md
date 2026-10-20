@@ -33,13 +33,14 @@ see [Troubleshooting](troubleshooting.md#reporting-bugs-beta-testing).
 | Feature | What it does | OpenAI | Bedrock |
 |---|---|:-:|:-:|
 | [Inpainting](features/inpainting.md) | Fill a selection from a text prompt | ✓ | ✓ |
-| [Erase Object](features/erase-object.md) | Remove what is selected, no prompt, three alternatives | | ✓ |
+| [Erase Object](features/erase-object.md) | Remove what is selected, no prompt, three alternatives | ✓ | ✓ |
 | [Generative Upscale](features/generative-upscale.md) | Enlarge a layer with a model - Fast, Conservative or Creative | | ✓ |
 | [Image Generation](features/image-generation.md) | Text to image, as a new layer or a new image; optional reference images | ✓ | ✓ |
 | [Layer Composite](features/layer-composite.md) | Blend upper layers into the base layer | ✓ | ✓ |
 
-Erase Object and Generative Upscale need Bedrock because OpenAI has no
-equivalent models.
+Generative Upscale needs Bedrock because OpenAI has no equivalent model.
+Erase Object works with OpenAI too, but Bedrock's dedicated erase model is
+more reliable at removing without inventing something new.
 
 ## Where to go next
 

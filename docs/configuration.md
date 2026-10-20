@@ -17,8 +17,8 @@ Everything is set in `Filters → AI → Settings...`. The plugin stores it in
 ## Choosing a provider
 
 **Inpainting Provider** in Settings picks OpenAI or Amazon Bedrock. The choice
-applies to every feature. Erase Object and Generative Upscale exist only on
-Bedrock.
+applies to every feature. Generative Upscale exists only on Bedrock. Erase
+Object works on both, but Bedrock's dedicated erase model gives cleaner results.
 
 ## OpenAI
 
@@ -42,6 +42,13 @@ shape. They also tend to paint *around* a masked hole rather than into it, so
 the plugin sends the selection once more as a white-on-black image and tells the
 model to work inside it. Set `"mask_hint": false` in the `openai` section of
 `config.json` to turn that off.
+
+Erase Object on OpenAI reads two more keys from the `openai` section:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `erase_variations` | `1` | How many alternatives Erase Object produces (1-4). Each one is a separate, billed request |
+| `erase_grow_mask` | `8` | Pixels the selection is grown by before erasing (0-50), so the object's edge and halo go too |
 
 ## Amazon Bedrock
 

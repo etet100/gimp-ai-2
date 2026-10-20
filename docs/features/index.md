@@ -13,7 +13,7 @@ do not like it.
 | Menu item | Page | Providers |
 |---|---|---|
 | Inpainting | [Inpainting](inpainting.md) | OpenAI, Bedrock |
-| Erase Object | [Erase Object](erase-object.md) | Bedrock |
+| Erase Object | [Erase Object](erase-object.md) | Bedrock (recommended), OpenAI |
 | Generative Upscale | [Generative Upscale](generative-upscale.md) | Bedrock |
 | Generate Layer, Generate New Image | [Image Generation](image-generation.md) | OpenAI, Bedrock |
 | Layer Composite | [Layer Composite](layer-composite.md) | OpenAI, Bedrock |
