@@ -11,17 +11,10 @@ mask, compare and undo.
 [![GIMP 3.0.4+](https://img.shields.io/badge/GIMP-3.0.4%2B-5C5543)](https://www.gimp.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-<!--
-Screenshots - add the files to docs/assets/screenshots/ and uncomment:
-
 <p align="center">
-  <img src="docs/assets/screenshots/erase-object.png" alt="Erase Object: before and after" width="800">
+  <img src="docs/assets/screenshots/hero-erase-inpaint.jpg" alt="Erase Object removes the astronaut, then Inpainting puts a cosmic cat in the same spot" width="900">
 </p>
-
-| Inpainting | Generative Upscale | Image Generation |
-|---|---|---|
-| ![Inpainting](docs/assets/screenshots/inpainting.png) | ![Generative Upscale](docs/assets/screenshots/generative-upscale.png) | ![Image Generation](docs/assets/screenshots/image-generation.png) |
--->
+<p align="center"><em>Two clicks in GIMP: erase the astronaut, then ask for a cosmic cat in the same spot.</em></p>
 
 ## What it does
 
@@ -33,6 +26,22 @@ Screenshots - add the files to docs/assets/screenshots/ and uncomment:
 
 Powered by **OpenAI GPT-Image** (2.5 Flare, 2.5 Sunburst, gpt-image-1) or
 **Amazon Bedrock** (Stability AI) - your choice, your API key.
+
+## See it in action
+
+**Inpainting** - select an area, describe the change, pick how much of the image
+the model gets to see. Other open images can be passed in as references.
+
+<p align="center">
+  <img src="docs/assets/screenshots/inpaint1.jpg" alt="The AI Inpaint dialog next to an image with a selection" width="700">
+</p>
+
+**Generate New Image** - type a prompt, choose a size, get a new GIMP image.
+Works even with no image open.
+
+| Prompt | Result |
+|:---:|:---:|
+| <img src="docs/assets/screenshots/newimage1.jpg" alt="The Generate New Image dialog with the prompt 'Lots of little horses'" width="400"> | <img src="docs/assets/screenshots/newimage2.jpg" alt="Generated image: a herd of miniature horses on a meadow" width="400"> |
 
 ## Why you might like it
 
@@ -46,6 +55,10 @@ Powered by **OpenAI GPT-Image** (2.5 Flare, 2.5 Sunburst, gpt-image-1) or
 1. Download the [latest release ZIP](https://github.com/etet100/gimp-ai-2/releases/latest) and extract it
 2. Run `python3 install_plugin.py`
 3. Restart GIMP, open `Filters → AI → Settings...` and enter your OpenAI API key or AWS credentials
+
+| Everything lives under `Filters → AI` | Pick a provider and model in Settings |
+|:---:|:---:|
+| <img src="docs/assets/screenshots/menu.jpg" alt="The Filters → AI menu" width="300"> | <img src="docs/assets/screenshots/settings1.jpg" alt="The AI Plugin Settings dialog" width="500"> |
 
 Requires **GIMP 3.0.4 or newer**. Prefer to copy files by hand, or using a
 Flatpak/Snap build? See the [installation guide](https://etet100.github.io/gimp-ai-2/installation.html).
