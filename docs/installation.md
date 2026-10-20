@@ -1,4 +1,9 @@
-# Installation Guide for GIMP AI Plugin
+---
+title: Installation
+nav_order: 2
+---
+
+# Installation
 
 **Complete step-by-step installation instructions for beginners**
 
@@ -6,19 +11,19 @@ This guide will walk you through installing the GIMP AI Plugin, even if you've n
 
 ---
 
-## 📋 What You'll Need
+## What You'll Need
 
 Before starting, make sure you have:
 
 1. ✅ **GIMP 3.0.4 or newer** installed (download from [gimp.org](https://www.gimp.org))
-2. ✅ **An OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com))
+2. ✅ **An OpenAI API key** (get one at [platform.openai.com](https://platform.openai.com)) **or AWS credentials with Amazon Bedrock access** - Erase Object and Generative Upscale need Bedrock
 3. ✅ **Internet connection** for downloading files and using AI features
 
 > **Important**: This plugin requires **GIMP 3.0.4 or newer**. Earlier versions are not compatible. The automated installer will detect all compatible GIMP versions and let you choose which to install to.
 
 ---
 
-## 🎯 Quick Overview
+## Quick Overview
 
 The installation process is simple:
 
@@ -33,7 +38,7 @@ The installation process is simple:
 
 **MANUAL METHOD:**
 
-1. Download 2 files
+1. Download 3 files
 2. Create a folder in GIMP's plugin directory
 3. Copy the files to that folder
 4. Restart GIMP
@@ -43,7 +48,7 @@ The installation process is simple:
 
 ---
 
-## 📥 Step 1: Download the Plugin Files
+## Step 1: Download the Plugin Files
 
 You need **exactly 3 files**:
 
@@ -53,7 +58,7 @@ You need **exactly 3 files**:
 
 ### Option A: Download Release Package with Automated Installer (Easiest!)
 
-1. Go to the [Releases page](https://github.com/lukaso/gimp-ai/releases)
+1. Go to the [Releases page](https://github.com/etet100/gimp-ai-2/releases)
 2. Download the latest `gimp-ai-plugin-vX.X.X.zip` file
 3. Extract the ZIP file
 4. Run the automated installer:
@@ -64,17 +69,17 @@ You need **exactly 3 files**:
 
 > **Multiple GIMP versions installed?** The installer will automatically detect all GIMP 3.X installations and let you choose which one to install to. It defaults to the latest stable version (e.g., 3.0, 3.2 are stable; 3.1, 3.3 are development).
 
-> **Using the automated installer?** You can skip to [Step 7: Configure Your API Key](#-step-7-configure-your-api-key) after running it!
+> **Using the automated installer?** You can skip to [Step 7: Configure Your API Key](#step-7-configure-your-api-key) after running it!
 
 ### Option B: Download from GitHub Release (Manual Install)
 
-1. Go to the [Releases page](https://github.com/lukaso/gimp-ai/releases)
+1. Go to the [Releases page](https://github.com/etet100/gimp-ai-2/releases)
 2. Download the latest `gimp-ai-plugin-vX.X.X.zip` file
 3. Extract the ZIP file - you'll see a `gimp-ai-plugin` folder containing all three files
 
 ### Option C: Download Individual Files
 
-1. Go to the [GitHub repository](https://github.com/lukaso/gimp-ai)
+1. Go to the [GitHub repository](https://github.com/etet100/gimp-ai-2)
 2. Click on `gimp-ai-plugin.py` → Click "Raw" → Save the file (Ctrl+S or Cmd+S)
 3. Go back and click on `coordinate_utils.py` → Click "Raw" → Save the file
 4. Do the same for `bedrock_client.py`
@@ -83,7 +88,7 @@ You need **exactly 3 files**:
 
 ---
 
-## 📁 Step 2: Find Your GIMP Plugin Directory
+## Step 2: Find Your GIMP Plugin Directory
 
 The plugin directory location depends on your operating system.
 
@@ -154,7 +159,7 @@ ls ~/.var/app/org.gimp.GIMP/config/GIMP/
 
 ---
 
-## 📂 Step 3: Create the Plugin Folder
+## Step 3: Create the Plugin Folder
 
 Inside your GIMP `plug-ins` directory, you need to create a **subdirectory** named `gimp-ai-plugin`.
 
@@ -195,7 +200,7 @@ mkdir ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin
 
 ---
 
-## 📋 Step 4: Copy the Plugin Files
+## Step 4: Copy the Plugin Files
 
 Now copy **all three files** you downloaded into the `gimp-ai-plugin` folder you just created.
 
@@ -214,7 +219,7 @@ All three files must be in the same `gimp-ai-plugin` folder!
 
 ---
 
-## 🔧 Step 5: Set File Permissions (Linux/macOS Only)
+## Step 5: Set File Permissions (Linux/macOS Only)
 
 **Windows users can skip this step.**
 
@@ -243,7 +248,7 @@ chmod +x ~/.var/app/org.gimp.GIMP/config/GIMP/3.0/plug-ins/gimp-ai-plugin/gimp-a
 
 ---
 
-## 🔄 Step 6: Restart GIMP
+## Step 6: Restart GIMP
 
 If GIMP is currently running:
 
@@ -255,9 +260,11 @@ If GIMP is currently running:
 
 ---
 
-## 🔑 Step 7: Configure Your API Key
+## Step 7: Configure Your API Key
 
 Now you'll set up your OpenAI API key so the plugin can access AI features.
+
+> **Using Amazon Bedrock instead?** Follow [Configuration → Amazon Bedrock](configuration.md#amazon-bedrock) and skip to Step 8.
 
 ### Get Your API Key
 
@@ -291,7 +298,7 @@ The plugin will **automatically save** your API key to its `config.json` in the 
 
 ---
 
-## ✅ Step 8: Test the Plugin
+## Step 8: Test the Plugin
 
 Let's verify everything is working:
 
@@ -315,7 +322,7 @@ Let's verify everything is working:
 
 ---
 
-## ❓ Troubleshooting
+## Troubleshooting
 
 ### I don't see "Filters → AI" in GIMP
 
@@ -354,31 +361,31 @@ Let's verify everything is working:
 
 ### Still Having Issues?
 
-See the detailed [TROUBLESHOOTING.md](TROUBLESHOOTING.md) guide or report issues at:
-https://github.com/lukaso/gimp-ai/issues
+See the detailed [Troubleshooting](troubleshooting.md) guide or report issues at:
+https://github.com/etet100/gimp-ai-2/issues
 
 ---
 
-## 🎉 You're Done!
+## You're Done!
 
 Congratulations! You've successfully installed the GIMP AI Plugin.
 
 ### Next Steps:
 
-- 📖 Read the [README.md](README.md) to learn about all features
+- 📖 Read about all [Features](features/index.md)
 - 🎨 Try the **Inpainting** feature on a photo
 - 🖼️ Generate some AI images with **Generate Layer** or **Generate New Image**
-- 📚 Check [CHANGELOG.md](CHANGELOG.md) for what's new
+- 📚 Check the [Changelog](https://github.com/etet100/gimp-ai-2/blob/main/CHANGELOG.md) for what's new
 
 ### Getting Help:
 
-- 💬 **Issues**: [GitHub Issues](https://github.com/lukaso/gimp-ai/issues)
-- 📖 **Troubleshooting**: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+- 💬 **Issues**: [GitHub Issues](https://github.com/etet100/gimp-ai-2/issues)
+- 📖 **Troubleshooting**: [Troubleshooting](troubleshooting.md)
 - 🐛 **Beta Feedback**: We appreciate bug reports and suggestions!
 
 ---
 
-## 🔄 Updating the Plugin
+## Updating the Plugin
 
 To update to a newer version:
 
@@ -390,15 +397,15 @@ Your API key and settings will be preserved.
 
 ---
 
-## 🗑️ Uninstalling
+## Uninstalling
 
 To remove the plugin:
 
 1. Delete the `gimp-ai-plugin` folder from your plug-ins directory
 2. Restart GIMP
 
-Your API key will remain in GIMP's preferences (harmless).
+Your settings remain in `gimp-ai-plugin/config.json` in the GIMP profile folder - delete that folder too if you want your API keys gone.
 
 ---
 
-**Need more help?** Check out the [TROUBLESHOOTING.md](TROUBLESHOOTING.md) guide!
+**Need more help?** Check out the [Troubleshooting](troubleshooting.md) guide!

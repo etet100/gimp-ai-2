@@ -1,3 +1,9 @@
+---
+title: Amazon Bedrock internals
+parent: Developers
+nav_order: 1
+---
+
 # Amazon Bedrock provider support
 
 Record of the changes that added Amazon Bedrock as an alternative provider to

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Documentation moved to a GitHub Pages site built from `docs/`
+  (https://etet100.github.io/gimp-ai-2/). The README is now a short overview
+  with a quick install; INSTALL.md, TROUBLESHOOTING.md, BEDROCK.md,
+  ALGORITHMS.md and RELEASE.md live under `docs/`
+- The release ZIP no longer includes INSTALL.md and TROUBLESHOOTING.md;
+  QUICK_START.txt and the installer link to the online guides instead
+
 ## [0.15.0] - 2026-10-20
 
 ### Added

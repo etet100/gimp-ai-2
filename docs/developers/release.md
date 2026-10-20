@@ -1,3 +1,9 @@
+---
+title: Release process
+parent: Developers
+nav_order: 3
+---
+
 # Release Process
 
 This document explains the release process for the GIMP AI Plugin.
@@ -32,7 +38,7 @@ When you merge the PR to `main`, the GitHub Actions workflow automatically:
 ### Step 3: Review the Release
 
 After the workflow completes:
-1. Go to the repository's [Releases page](https://github.com/lukaso/gimp-ai/releases)
+1. Go to the repository's [Releases page](https://github.com/etet100/gimp-ai-2/releases)
 2. Review the auto-generated release notes
 3. Edit if needed to add highlights or clarifications
 4. The release ZIP is already attached and ready for download
@@ -52,8 +58,8 @@ python3 build_release.py
 ```
 
 This creates `dist/gimp-ai-plugin-vX.X.X.zip` containing:
-- The `gimp-ai-plugin/` folder with both required Python files
-- Complete documentation (INSTALL.md, README.md, TROUBLESHOOTING.md)
+- The `gimp-ai-plugin/` folder with the three required Python files
+- README.md, CHANGELOG.md and LICENSE (the full guides live on the [documentation site](../index.md))
 - Automated installer script (`install_plugin.py`)
 - Quick start guide (QUICK_START.txt)
 
@@ -92,15 +98,15 @@ This creates `dist/gimp-ai-plugin-vX.X.X.zip` containing:
 
 A Python plugin for GIMP 3.0+ that integrates AI image generation capabilities.
 
-## 📥 Download
+## Download
 
 Download **gimp-ai-plugin-v0.8.0-beta.zip** below.
 
-## ✨ What's New
+## What's New
 
 [List changes here - see CHANGELOG.md]
 
-## 🚀 Installation (Super Easy!)
+## Installation (Super Easy!)
 
 ### Option 1: Automated Installer (Recommended)
 
@@ -121,34 +127,34 @@ That's it! The installer handles everything automatically.
 3. On Linux/macOS: `chmod +x gimp-ai-plugin/gimp-ai-plugin.py`
 4. Restart GIMP
 
-See **INSTALL.md** (included in ZIP) for detailed step-by-step instructions.
+See the [installation guide](https://etet100.github.io/gimp-ai-2/installation.html) for detailed step-by-step instructions.
 
-## 📋 Requirements
+## Requirements
 
 - GIMP 3.0.4+ or 3.1.x
 - OpenAI API key ([get one here](https://platform.openai.com))
 - Internet connection
 
-## 🎨 Features
+## Features
 
 - **AI Inpainting** - Fill selected areas with AI-generated content
 - **Image Generation** - Create new images from text descriptions
 - **Layer Composite** - Intelligently blend layers with AI guidance
 
-## 📚 Documentation
+## Documentation
 
 Included in the ZIP file:
 - **QUICK_START.txt** - Get started in minutes
-- **INSTALL.md** - Detailed installation guide
-- **README.md** - Feature overview and usage
-- **TROUBLESHOOTING.md** - Common issues and solutions
+- **README.md** - Feature overview
 
-## 🆘 Need Help?
+Online: [documentation site](https://etet100.github.io/gimp-ai-2/)
 
-- 📖 Check **TROUBLESHOOTING.md** (in the ZIP)
-- 🐛 [Report issues on GitHub](https://github.com/lukaso/gimp-ai/issues)
+## Need Help?
 
-## 🧪 Beta Notes
+- 📖 Check the [troubleshooting guide](https://etet100.github.io/gimp-ai-2/troubleshooting.html)
+- 🐛 [Report issues on GitHub](https://github.com/etet100/gimp-ai-2/issues)
+
+## Beta Notes
 
 This is a **beta release**. We're looking for testers on all platforms!
 
@@ -169,8 +175,8 @@ The `build_release.py` script is used by both the automated workflow and manual 
 
 1. **Extracts the version** from `gimp-ai-plugin.py` (reads the VERSION constant)
 2. **Creates a clean build directory** in `dist/`
-3. **Copies plugin files** (`gimp-ai-plugin.py` and `coordinate_utils.py`) into a `gimp-ai-plugin/` subdirectory
-4. **Copies documentation** (INSTALL.md, README.md, TROUBLESHOOTING.md, CHANGELOG.md, LICENSE)
+3. **Copies plugin files** (`gimp-ai-plugin.py`, `coordinate_utils.py` and `bedrock_client.py`) into a `gimp-ai-plugin/` subdirectory
+4. **Copies documentation** (README.md, CHANGELOG.md, LICENSE)
 5. **Includes the installer** (`install_plugin.py`)
 6. **Generates QUICK_START.txt** with installation instructions
 7. **Creates a ZIP file** named `gimp-ai-plugin-vX.X.X.zip`
@@ -230,15 +236,14 @@ When users download `gimp-ai-plugin-v0.8.0-beta.zip`, they get:
 ```
 gimp-ai-plugin-v0.8.0-beta.zip
 ├── CHANGELOG.md                    # Version history
-├── INSTALL.md                      # Complete installation guide
 ├── LICENSE                         # MIT license
 ├── QUICK_START.txt                 # Quick reference guide
 ├── README.md                       # Feature overview
-├── TROUBLESHOOTING.md              # Problem solving guide
 ├── install_plugin.py               # Automated installer script
 └── gimp-ai-plugin/                 # Plugin folder (ready to copy)
     ├── gimp-ai-plugin.py          # Main plugin file
-    └── coordinate_utils.py         # Required helper functions
+    ├── coordinate_utils.py         # Required helper functions
+    └── bedrock_client.py           # Amazon Bedrock support
 ```
 
 ## What Makes This Easy for Users

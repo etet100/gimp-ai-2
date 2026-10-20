@@ -67,7 +67,7 @@ This file provides guidance to GitHub Copilot when working with code in this rep
    - Optimal shape selection for gpt-image-1 (1024×1024, 1536×1024, 1024×1536)
    - Free-size request shapes for GPT-Image-2.x (`get_gpt_image_shape()`)
    - Padding and scaling algorithms
-   - See `ALGORITHMS.md` for detailed algorithm documentation
+   - See `docs/developers/algorithms.md` for detailed algorithm documentation
 
 3. **`bedrock_client.py`** (Bedrock transport, ~550 lines)
    - **Pure functions with no GIMP dependencies** (unit testable, `python3 bedrock_client.py` self-checks)
@@ -239,23 +239,29 @@ See `coordinate_utils.py` `get_optimal_openai_shape()`:
 5. **Place result** back into GIMP, accounting for scaling/padding
 6. **Create layer mask** to limit visibility to original selection
 
-Detailed algorithms documented in `ALGORITHMS.md`.
+Detailed algorithms documented in `docs/developers/algorithms.md`.
 
 ## Documentation
 
 ### Essential Files
-- **`README.md`**: Installation, usage, and quick start guide
+- **`README.md`**: Short pitch, screenshots, quick install, links to the docs site
+- **`docs/`**: GitHub Pages site (Jekyll, Just the Docs theme), published at
+  https://etet100.github.io/gimp-ai-2/
+  - `installation.md`, `configuration.md`, `troubleshooting.md`
+  - `features/` - one page per menu item
+  - `developers/` - `bedrock.md`, `algorithms.md`, `release.md`
 - **`CHANGELOG.md`**: Version history and known issues
-- **`TROUBLESHOOTING.md`**: Platform-specific issues and solutions
 - **`TODO.md`**: Development roadmap and beta testing plan
-- **`ALGORITHMS.md`**: Detailed coordinate transformation algorithms
 - **`LICENSE`**: MIT license
 
 ### Documentation Standards
-- Keep README focused on user-facing content
-- Technical details go in ALGORITHMS.md or code comments
+- Keep README short: pitch, screenshots, quick install, links. Details go to `docs/`
+- Feature usage goes in `docs/features/`, settings in `docs/configuration.md`
+- Technical details go in `docs/developers/` or code comments
+- Link between docs pages with relative `.md` links (they work on GitHub and Pages);
+  link from README, the installer and `build_release.py` with absolute Pages URLs
 - Update CHANGELOG.md for all notable changes
-- Add new issues to TROUBLESHOOTING.md as they're discovered
+- Add new issues to `docs/troubleshooting.md` as they're discovered
 
 ## Development Workflow
 
@@ -288,7 +294,7 @@ between tries.
 **Modifying coordinate logic:**
 1. Update functions in `coordinate_utils.py`
 2. Add unit tests for new logic
-3. Update `ALGORITHMS.md` if algorithm changes
+3. Update `docs/developers/algorithms.md` if algorithm changes
 4. Test with various image sizes/aspect ratios
 
 **Never place layers with Gegl `buffer-source -> translate -> write-buffer`.**
@@ -388,7 +394,7 @@ the mask entirely unless it happens to be in the top-left corner.
 
 ## Getting Help
 
-- **Troubleshooting**: See `TROUBLESHOOTING.md` first
-- **Algorithms**: See `ALGORITHMS.md` for coordinate transformation details
+- **Troubleshooting**: See `docs/troubleshooting.md` first
+- **Algorithms**: See `docs/developers/algorithms.md` for coordinate transformation details
 - **GIMP API**: Official docs at https://www.gimp.org/docs/python/
 - **Issues**: Report bugs on GitHub issue tracker

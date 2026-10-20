@@ -1,3 +1,9 @@
+---
+title: Image preparation algorithms
+parent: Developers
+nav_order: 2
+---
+
 # Image Preparation Algorithms
 
 This document describes how images are prepared for the image APIs (OpenAI

@@ -78,10 +78,8 @@ def create_release_package():
     
     # Documentation files to include in the root
     doc_files = [
-        "INSTALL.md",
         "README.md",
         "LICENSE",
-        "TROUBLESHOOTING.md",
         "CHANGELOG.md",
         "install_plugin.py"  # Include the automated installer
     ]
@@ -161,15 +159,16 @@ AFTER INSTALLATION:
 
 3. 🎨 TEST THE PLUGIN:
 
-   Try: Filters → AI → Image Generator
+   Try: Filters → AI → Generate Layer
    Enter: "blue sky with clouds"
 
 NEED HELP?
 ----------
 
-📖 See INSTALL.md for detailed step-by-step instructions
-🐛 Having issues? Check TROUBLESHOOTING.md
-📝 Report bugs: https://github.com/lukaso/gimp-ai/issues
+📖 Documentation: https://etet100.github.io/gimp-ai-2/
+📖 Installation guide: https://etet100.github.io/gimp-ai-2/installation.html
+🐛 Having issues? https://etet100.github.io/gimp-ai-2/troubleshooting.html
+📝 Report bugs: https://github.com/etet100/gimp-ai-2/issues
 
 USAGE:
 ------
@@ -177,7 +176,9 @@ USAGE:
 After installation, find AI features at: Filters → AI
 
 - 🎨 Inpainting - Fill selections with AI content
-- 🖼️ Image Generator - Create images from text
+- 🧹 Erase Object - Remove a selected object (Amazon Bedrock)
+- 🔍 Generative Upscale - Enlarge a layer with AI (Amazon Bedrock)
+- 🖼️ Generate Layer / Generate New Image - Create images from text
 - 🔄 Layer Composite - Blend layers with AI
 
 Enjoy!

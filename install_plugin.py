@@ -303,7 +303,7 @@ def install_plugin():
         print("❌ ERROR: Could not determine GIMP plugins directory")
         print()
         print("Please install GIMP 3.0.4+ first, or install manually:")
-        print("See INSTALL.md for manual installation instructions.")
+        print("See https://etet100.github.io/gimp-ai-2/installation.html for manual installation instructions.")
         return False
 
     print(f"✅ GIMP plugins directory: {plugins_dir}")
@@ -410,15 +410,15 @@ def print_next_steps():
     print("       so use the API key field or launch GIMP with AWS_* exported)")
     print()
     print("4. 🎨 Test the plugin:")
-    print("   Try: Filters → AI → Image Generator")
+    print("   Try: Filters → AI → Generate Layer")
     print("   Enter a prompt like: 'blue sky with clouds'")
     print()
     print("=" * 60)
     print()
     print("📖 For more help:")
-    print("   • Installation guide: INSTALL.md")
-    print("   • Troubleshooting: TROUBLESHOOTING.md")
-    print("   • Report issues: https://github.com/lukaso/gimp-ai/issues")
+    print("   • Documentation: https://etet100.github.io/gimp-ai-2/")
+    print("   • Troubleshooting: https://etet100.github.io/gimp-ai-2/troubleshooting.html")
+    print("   • Report issues: https://github.com/etet100/gimp-ai-2/issues")
     print()
     print("🎉 Enjoy using GIMP AI Plugin!")
 
@@ -434,7 +434,7 @@ def main():
         else:
             print()
             print("Installation failed. Please try manual installation:")
-            print("See INSTALL.md for detailed instructions.")
+            print("See https://etet100.github.io/gimp-ai-2/installation.html for detailed instructions.")
             return 1
 
     except KeyboardInterrupt:
@@ -446,7 +446,7 @@ def main():
 
         traceback.print_exc()
         print()
-        print("Please try manual installation. See INSTALL.md for instructions.")
+        print("Please try manual installation. See https://etet100.github.io/gimp-ai-2/installation.html")
         return 1
 
 
