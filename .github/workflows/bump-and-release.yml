@@ -96,9 +96,10 @@ jobs:
           # PR title and body
           PR_TITLE=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH")
           PR_BODY=$(jq -r '.pull_request.body' "$GITHUB_EVENT_PATH")
-          # commits since last tag (if any)
-          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
-            LAST_TAG=$(git describe --tags --abbrev=0)
+          # commits since the previous tag (if any) - the tag created above
+          # already points at HEAD, so it must be excluded
+          NEW="v${{ steps.bump.outputs.new_version }}"
+          if LAST_TAG=$(git describe --tags --abbrev=0 --exclude "$NEW" 2>/dev/null); then
             CHANGES=$(git --no-pager log --pretty=format:"- %s (%h)" "${LAST_TAG}..HEAD")
           else
             CHANGES=$(git --no-pager log --pretty=format:"- %s (%h)" HEAD)

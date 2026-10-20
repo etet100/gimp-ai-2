@@ -18,3 +18,6 @@ tests/fit_test_result.txt
 tests/upscale_test_result.txt
 tests/inpaint_test_result.txt
 tests/inpaint_variation_*.png
+
+# Local config with real API keys
+config.json
