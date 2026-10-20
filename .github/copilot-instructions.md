@@ -4,13 +4,13 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ## Project Overview
 
-**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (v0.8) supporting OpenAI's image generation models for inpainting, image generation, and layer compositing, plus Amazon Bedrock as an alternative inpainting provider.
+**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (the current version is the `VERSION` constant in `gimp-ai-plugin.py`) supporting OpenAI's GPT-Image models for inpainting, image generation, and layer compositing, plus Amazon Bedrock (Stability AI) as an alternative provider.
 
 ### Key Features
 - **AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
 - **AI Erase Object**: Remove a selected object and fill from surrounding context; three variations per run (Bedrock only)
 - **AI Generative Upscale**: Enlarge the active layer with Stability's upscale models (Bedrock only)
-- **AI Image Generation**: Create new images from text descriptions as new layers
+- **AI Image Generation**: Create images from text, as a new layer (Generate Layer) or a new image (Generate New Image); OpenAI can also take reference images
 - **AI Layer Composite**: Intelligently blend AI content into existing images
 - **Zero External Dependencies**: Uses only Python standard library + GIMP APIs
 
@@ -31,8 +31,12 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ### External APIs
 - **OpenAI Image API** (`https://api.openai.com/v1/images/...`)
+  - Models: `gpt-image-2.5-flare` (default), `gpt-image-2.5-sunburst`,
+    `gpt-image-1` (legacy) - chosen in Settings, stored as `openai.model`
   - Generations endpoint for creating images
-  - Edits endpoint for inpainting
+  - Edits endpoint for inpainting, and for generation with reference images
+    (no mask). Up to 16 input images per call; masks must be under 4 MB
+  - `input_fidelity` is sent to gpt-image-1 only - the 2.x models reject it
 - **Amazon Bedrock Runtime** (`https://bedrock-runtime.{region}.amazonaws.com/model/{id}/invoke`)
   - Stability AI models: inpainting, layer composite, object erase, generation
   - Editing models need a geography-prefixed inference profile; the generation
@@ -47,24 +51,25 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ### Core Files
 
-1. **`gimp-ai-plugin.py`** (Main plugin, ~4000 lines)
+1. **`gimp-ai-plugin.py`** (Main plugin, ~6900 lines)
    - `GimpAIPlugin` class: Main plugin entry point
-   - Procedure registration (5 procedures: inpainting, erase object, generative
-     upscale, generation, composite)
+   - Procedure registration (7 procedures: inpainting, erase object, generative
+     upscale, generate layer, generate new image, composite, settings)
    - Configuration management (API key storage)
    - UI dialogs (GTK-based settings and progress)
    - OpenAI API communication
    - Image processing pipeline
 
-2. **`coordinate_utils.py`** (Pure math utilities, ~600 lines)
+2. **`coordinate_utils.py`** (Pure math utilities, ~650 lines)
    - **Pure functions with no GIMP dependencies** (unit testable)
    - Coordinate transformations for context extraction
    - Mask calculations
-   - Optimal shape selection for OpenAI API (1024×1024, 1536×1024, 1024×1536)
+   - Optimal shape selection for gpt-image-1 (1024×1024, 1536×1024, 1024×1536)
+   - Free-size request shapes for GPT-Image-2.x (`get_gpt_image_shape()`)
    - Padding and scaling algorithms
    - See `ALGORITHMS.md` for detailed algorithm documentation
 
-3. **`bedrock_client.py`** (Bedrock transport, ~250 lines)
+3. **`bedrock_client.py`** (Bedrock transport, ~550 lines)
    - **Pure functions with no GIMP dependencies** (unit testable, `python3 bedrock_client.py` self-checks)
    - SigV4 signing with `hmac`/`hashlib` - no boto3, since installing packages
      into GIMP's bundled Python is painful
@@ -114,9 +119,11 @@ class MyPlugin(Gimp.PlugIn):
 
 ### Configuration Management
 - `api_provider` selects the inpainting provider: `"openai"` or `"bedrock"`
-- Bedrock settings live under the `"bedrock"` key (region, model_id, api_key, profile)
-- API keys stored in `~/.config/gimp-ai-plugin/config.json`
-- Fallback locations: `~/.gimp-ai-config.json`, local `config.json`
+- OpenAI settings live under the `"openai"` key (api_key, model, mask_hint)
+- Bedrock settings live under the `"bedrock"` key (region, model_id, api_key,
+  profile, erase/inpaint variations, generation region, upscale options)
+- Config is stored in `<GIMP profile>/gimp-ai-plugin/config.json` (`Gimp.directory()`)
+- Fallback locations: `~/.config/gimp-ai/config.json`, `~/.gimp-ai-config.json`, local `config.json`
 - Never commit real API keys to the repository
 
 ### Error Handling
@@ -146,7 +153,8 @@ class MyPlugin(Gimp.PlugIn):
   Rebinding the plugin methods onto a plain object is required - instantiating
   `GimpAIPlugin` outside the plug-in protocol aborts GIMP
 - **Manual testing**: Required for UI and GIMP integration
-  - Test all five procedures: inpainting, erase object, generative upscale, generation, composite
+  - Test all procedures: inpainting, erase object, generative upscale, generate layer,
+    generate new image (also with no image open), composite, settings
   - Test with various image sizes and aspect ratios
   - Test cancellation behavior
   - Test error handling (invalid API keys, network failures)
@@ -199,12 +207,25 @@ The plugin intentionally uses only standard library + GIMP APIs. The `requiremen
 ## OpenAI API Integration
 
 ### Supported Image Dimensions
-OpenAI DALL-E API only accepts three specific sizes:
+gpt-image-1 only accepts three specific sizes:
 - **Square**: 1024 × 1024
 - **Landscape**: 1536 × 1024  
 - **Portrait**: 1024 × 1536
 
-### Shape Selection Algorithm
+The GPT-Image-2.x models accept any size with both sides multiples of 16, the
+longest side ≤ 3840, aspect ≤ 3:1 and 655,360-8,294,400 pixels
+(`is_valid_gpt_image_size()`). `get_gpt_image_shape()` keeps content at native
+resolution and caps it at 2560×1440 (above that OpenAI marks output
+experimental), except for sizes the user picks explicitly for a new image.
+Focused inpainting with these models uses `calculate_native_context()`, like
+Bedrock. `_openai_accepts_any_size()` is the switch between the two paths.
+
+**Mask hint:** the 2.x models treat the edits mask as a blacked-out hole and
+paint around it, so the selection is also sent as a white-on-black image
+(image 2, references follow) and the prompt is rewritten to point at it - see
+`_prompt_with_mask_hint()`. Config `openai.mask_hint`, default on for 2.x.
+
+### Shape Selection Algorithm (gpt-image-1)
 See `coordinate_utils.py` `get_optimal_openai_shape()`:
 - Aspect ratio > 1.3 → Landscape
 - Aspect ratio < 0.77 → Portrait
@@ -241,7 +262,7 @@ Detailed algorithms documented in `ALGORITHMS.md`.
 ### Making Changes
 
 1. **Test locally first**: Copy to GIMP plugin dir and restart GIMP
-2. **Test all five features**: Inpainting, erase object, generative upscale, generation, composite
+2. **Test all features**: Inpainting, erase object, generative upscale, generate layer, generate new image, composite
 3. **Test error paths**: Invalid inputs, API failures, cancellation
 4. **Update documentation**: If adding features or changing behavior
 5. **Consider coordinate_utils.py**: If adding coordinate logic, keep it pure (no GIMP deps)
@@ -249,13 +270,20 @@ Detailed algorithms documented in `ALGORITHMS.md`.
 ### Common Tasks
 
 **Menu items** (`Filters → AI`): Inpainting, Erase Object, Generative Upscale,
-Image Generator, Layer Composite.
+Generate Layer, Generate New Image (also `File → Create`), Layer Composite,
+Settings...
+
+**Failed requests keep the dialog open.** Each run method wraps one try in an
+`attempt()` closure returning `(headline, details)` on failure, and
+`_offer_retry()` hands the dialog back with a Try Again button. Read
+credentials and the selection inside `attempt()`, since both can change
+between tries.
 
 **Adding a new procedure:**
 1. Add procedure name to `do_query_procedures()`
-2. Implement creation in `do_create_procedure()`
+2. Implement creation in `do_create_procedure()`, including menu label, menu
+   path and `set_sensitivity_mask()` (use `ALWAYS` if it works with no image open)
 3. Implement run method (e.g., `run_inpaint()`)
-4. Update menu registration in `do_set_i18n()`
 
 **Modifying coordinate logic:**
 1. Update functions in `coordinate_utils.py`
@@ -269,8 +297,8 @@ That chain writes zero pixels under GIMP 3.2 - verified with
 `set_offsets()`, and call `add_alpha()` before `resize_to_image_size()` or the
 grown area is filled with opaque background instead of transparency.
 
-**Bedrock does not need the OpenAI shapes.** `get_optimal_openai_shape()` exists
-because OpenAI accepts only 1024x1024 / 1536x1024 / 1024x1536. Stability accepts
+**Bedrock and GPT-Image-2.x do not need the fixed shapes.** `get_optimal_openai_shape()`
+exists because gpt-image-1 accepts only 1024x1024 / 1536x1024 / 1024x1536. Stability accepts
 any size from 64px per side up to 9.4MP, so Bedrock paths use
 `calculate_native_context()` instead: a ~1MP window at native resolution that
 never upscales. Do not exceed about a megapixel - Stability downsamples above
@@ -286,11 +314,12 @@ the mask entirely unless it happens to be in the top-left corner.
 **Mask conventions differ between providers:**
 - OpenAI: the area to inpaint is transparent
 - Bedrock/Stability: the area to inpaint is white, preserved areas are black
-- `_convert_mask_to_bedrock()` flattens the OpenAI mask onto white to convert,
-  which must run on the main thread because it uses GIMP image operations
+- `_convert_mask_to_luminance()` flattens the OpenAI mask onto white to convert
+  (also used for the OpenAI mask hint image), which must run on the main thread
+  because it uses GIMP image operations
 
 **Changing API integration:**
-1. Update in `_call_openai_api()`, `_call_bedrock_edit()` or related methods
+1. Update in `_call_openai_edit()`, `_call_openai_generation()`, `_call_bedrock_edit()` or related methods
 2. Handle new error cases
 3. Update configuration if needed
 4. Test with real API calls
@@ -316,12 +345,12 @@ the mask entirely unless it happens to be in the top-left corner.
 (See `CHANGELOG.md` for current version's known issues)
 
 ### API Limitations
-- OpenAI API only accepts specific image dimensions (1024×1024, 1536×1024, 1024×1536)
+- gpt-image-1 only accepts specific image dimensions (1024×1024, 1536×1024, 1024×1536); the 2.x models take free sizes within limits
 - AI may modify areas outside selection for visual coherence (only final output is masked)
 
 ### Performance Considerations
 - Large images (>2048px) may require more memory
-- API calls can take 10-30 seconds depending on network/load
+- API calls can take 10-30 seconds depending on network/load; the GPT-Image-2.x models can take longer (timeout 300s)
 - Cancellation is only checked between major operations
 
 ## Pull Request Guidelines
@@ -344,7 +373,7 @@ the mask entirely unless it happens to be in the top-left corner.
 - [ ] Code follows Python conventions (PEP 8)
 - [ ] No external dependencies added (unless absolutely necessary)
 - [ ] Plugin loads and appears in GIMP menu
-- [ ] All five features still work (inpainting, erase object, generative upscale, generation, composite)
+- [ ] All features still work (inpainting, erase object, generative upscale, generate layer, generate new image, composite)
 - [ ] Error handling is appropriate
 - [ ] Documentation updated if needed
 - [ ] No API keys committed to repository

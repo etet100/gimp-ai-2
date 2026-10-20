@@ -5,7 +5,7 @@
 GIMP AI Plugin - Simplified version to fix crash
 """
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 import sys
 import os
@@ -17,6 +17,7 @@ import urllib.error
 import ssl
 import base64
 import tempfile
+import threading
 import uuid
 
 gi.require_version("Gimp", "3.0")
@@ -25,7 +26,8 @@ gi.require_version("Gegl", "0.4")
 gi.require_version("Gio", "2.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gimp, GimpUi, GLib, Gegl, Gio, Gtk, Gdk
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gimp, GimpUi, GLib, Gegl, Gio, Gtk, Gdk, GdkPixbuf
 
 # Import pure coordinate transformation functions
 from coordinate_utils import (
@@ -33,6 +35,9 @@ from coordinate_utils import (
     calculate_placement_coordinates,
     validate_context_info,
     get_optimal_openai_shape,
+    get_gpt_image_shape,
+    GPT_IMAGE_MAX_PIXELS,
+    GPT_IMAGE_LIMIT_PIXELS,
     calculate_padding_for_shape,
     extract_context_with_selection,
     calculate_result_placement,
@@ -47,6 +52,92 @@ except ImportError as e:
     bedrock_client = None
     print(f"DEBUG: Bedrock support unavailable: {e}")
 
+# OpenAI image models offered in Settings, as (model id, label)
+OPENAI_IMAGE_MODELS = [
+    ("gpt-image-2.5-flare", "GPT-Image-2.5 Flare (fast, recommended)"),
+    ("gpt-image-2.5-sunburst", "GPT-Image-2.5 Sunburst (slower, more precise)"),
+    ("gpt-image-1", "GPT-Image-1 (legacy)"),
+]
+DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
+
+# Newer models are slower at high quality, so allow them more time
+OPENAI_TIMEOUT = 300
+
+# Reference images picked from other open images. Each one costs input tokens
+# at high fidelity, so they are reduced in size. The dialog starts with a few
+# slots and more can be added, up to what the OpenAI API accepts in one call
+# (the edited image, when there is one, counts towards that limit).
+REFERENCE_INITIAL_SLOTS = 2
+OPENAI_MAX_INPUT_IMAGES = 16
+REFERENCE_MAX_EDGE = 1536
+
+# Dialog styling, scoped to .ai-dialog so GIMP's own widgets are untouched.
+# Colours come from the active theme where possible, so light themes work too.
+DIALOG_CSS = b"""
+.ai-dialog .ai-section-icon { color: @theme_selected_bg_color; }
+.ai-dialog .ai-section-title { font-weight: bold; font-size: 1.2em; }
+.ai-dialog .ai-section-subtitle { opacity: 0.7; }
+.ai-dialog .ai-badge {
+    border: 1px solid alpha(@theme_fg_color, 0.35);
+    border-radius: 10px;
+    padding: 1px 9px;
+    font-size: 0.85em;
+}
+.ai-dialog .ai-prompt-frame { border-radius: 6px; }
+.ai-dialog .ai-status {
+    border: 1px solid alpha(@theme_fg_color, 0.15);
+    border-radius: 8px;
+    background-color: alpha(@theme_fg_color, 0.04);
+    padding: 10px 14px;
+}
+.ai-dialog .ai-status-headline { font-weight: bold; }
+.ai-dialog .ai-status.error {
+    border-color: #e8912d;
+    background-color: alpha(#e8912d, 0.12);
+}
+.ai-dialog .ai-status.error .ai-status-headline { color: #f0a040; }
+.ai-dialog .ai-status.success {
+    border-color: #4caf50;
+    background-color: alpha(#4caf50, 0.10);
+}
+.ai-dialog .ai-status.success .ai-status-headline { color: #66bb6a; }
+.ai-dialog button.suggested-action {
+    background-image: none;
+    background-color: @theme_selected_bg_color;
+    border-color: shade(@theme_selected_bg_color, 0.8);
+    color: @theme_selected_fg_color;
+}
+.ai-dialog button.suggested-action:hover {
+    background-color: shade(@theme_selected_bg_color, 1.15);
+}
+.ai-dialog button.suggested-action:active {
+    background-color: shade(@theme_selected_bg_color, 0.9);
+}
+.ai-dialog button.suggested-action:disabled {
+    background-color: alpha(@theme_selected_bg_color, 0.4);
+    color: alpha(@theme_selected_fg_color, 0.6);
+}
+.ai-dialog button.suggested-action label { color: inherit; }
+"""
+
+# Icon candidates per section; the first one the icon theme has is used
+SECTION_ICONS = {
+    "prompt": ["gtk-edit", "gimp-tool-pencil", "document-edit-symbolic"],
+    "mode": ["gimp-tool-rect-select", "edit-select-all-symbolic"],
+    "size": ["gimp-resize", "image-x-generic-symbolic"],
+    "references": ["gimp-images", "insert-image-symbolic", "image-x-generic-symbolic"],
+    "status": ["gimp-info", "dialog-information-symbolic"],
+    "layers": ["gimp-layers", "view-list-symbolic"],
+    "mask": ["gimp-layer-mask", "gimp-selection", "edit-select-all-symbolic"],
+    "upscale": ["gimp-tool-scale", "gimp-scale", "zoom-in-symbolic"],
+    "erase": ["gimp-tool-eraser", "edit-clear-symbolic"],
+    "provider": ["preferences-system", "preferences-system-symbolic"],
+    "openai": ["gimp-prefs-folders-plug-ins", "network-server-symbolic"],
+    "bedrock": ["gimp-prefs-system-resources", "network-server-symbolic"],
+    "history": ["gimp-undo-history", "document-open-recent-symbolic"],
+    "debug": ["gimp-prefs-playground", "dialog-warning-symbolic"],
+}
+
 
 class GimpAIPlugin(Gimp.PlugIn):
     """Simplified AI Plugin"""
@@ -55,6 +146,8 @@ class GimpAIPlugin(Gimp.PlugIn):
         super().__init__()
         self.config = self._load_config()
         self._cancel_requested = False
+        self._dialog_size = None
+        self._dialog_references = []
 
     def _load_config(self):
         """Load configuration from various locations"""
@@ -247,6 +340,287 @@ class GimpAIPlugin(Gimp.PlugIn):
         # No API key found
         return None
 
+    def _get_openai_model(self):
+        """OpenAI image model id from config, defaulting to GPT-Image-2.5 Flare"""
+        model = self.config.get("openai", {}).get("model")
+        return model or DEFAULT_OPENAI_MODEL
+
+    def _openai_accepts_any_size(self):
+        """gpt-image-1 only takes three fixed shapes; the 2.x models take any size"""
+        return self._get_openai_model() != "gpt-image-1"
+
+    def _openai_generation_size(self, width, height, exact=False):
+        """
+        OpenAI generation size string for a target of width x height.
+
+        exact: the user picked this size for a new image, so honour it up to
+        the API limit; otherwise (fitting an existing canvas) stay within the
+        non-experimental size.
+        """
+        if self._openai_accepts_any_size():
+            max_pixels = GPT_IMAGE_LIMIT_PIXELS if exact else GPT_IMAGE_MAX_PIXELS
+            target_w, target_h = get_gpt_image_shape(width, height, max_pixels)
+        else:
+            target_w, target_h = get_optimal_openai_shape(width, height)
+        return f"{target_w}x{target_h}"
+
+    def _generation_size_presets(self):
+        """
+        Size choices for generating a new image: ([(label, (w, h))], allow_custom).
+
+        gpt-image-1 has three fixed shapes and Stability picks its own size from
+        an aspect ratio, so only GPT-Image-2.x offers larger and custom sizes.
+        """
+        if self._get_provider() == "bedrock":
+            return [
+                ("Square 1:1", (1024, 1024)),
+                ("Landscape 3:2", (1536, 1024)),
+                ("Portrait 2:3", (1024, 1536)),
+                ("Widescreen 16:9", (1920, 1080)),
+                ("Tall 9:16", (1080, 1920)),
+            ], False
+        if not self._openai_accepts_any_size():
+            return [
+                ("Square 1024x1024", (1024, 1024)),
+                ("Landscape 1536x1024", (1536, 1024)),
+                ("Portrait 1024x1536", (1024, 1536)),
+            ], False
+        return [
+            ("Square 1024x1024", (1024, 1024)),
+            ("Square 2048x2048", (2048, 2048)),
+            ("Landscape 3:2 1536x1024", (1536, 1024)),
+            ("Portrait 2:3 1024x1536", (1024, 1536)),
+            ("Widescreen 16:9 2048x1152", (2048, 1152)),
+            ("Tall 9:16 1152x2048", (1152, 2048)),
+            ("4K landscape 3840x2160 (experimental)", (3840, 2160)),
+            ("4K portrait 2160x3840 (experimental)", (2160, 3840)),
+        ], True
+
+    def _add_reference_pickers(self, content_area, exclude_image=None,
+                               title="Reference Images",
+                               max_slots=OPENAI_MAX_INPUT_IMAGES):
+        """
+        Add combo boxes listing the other open images with thumbnails, starting
+        with REFERENCE_INITIAL_SLOTS and a button that adds more, up to
+        max_slots. Returns the list of combo boxes for _read_reference_pickers();
+        slots added later are appended to that same list.
+        """
+        exclude_id = exclude_image.get_id() if exclude_image else None
+        candidates = [
+            img for img in Gimp.get_images() if img.get_id() != exclude_id
+        ]
+
+        # The add button sits in the section header to keep the dialog short
+        add_button = None
+        if candidates:
+            add_button = Gtk.Button(label="Add reference")
+            add_button.set_image(
+                Gtk.Image.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON)
+            )
+            add_button.set_always_show_image(True)
+
+        box = self._add_section(
+            content_area, title,
+            "Use other open images as references for the result. Refer to "
+            "them in the prompt as reference 1, reference 2, and so on.",
+            icon="references", badge="Optional", header_widget=add_button,
+        )
+
+        if not candidates:
+            note = Gtk.Label(label="Open other images in GIMP to use them as references")
+            note.set_halign(Gtk.Align.START)
+            note.get_style_context().add_class("dim-label")
+            box.pack_start(note, False, False, 0)
+            return []
+
+        # One shared model: thumbnail, label, image id (-1 = none)
+        store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, int)
+        store.append([None, "(none)", -1])
+        for img in candidates:
+            try:
+                thumbnail = img.get_thumbnail(
+                    32, 32, Gimp.PixbufTransparency.SMALL_CHECKS
+                )
+            except Exception as e:
+                print(f"DEBUG: No thumbnail for image {img.get_id()}: {e}")
+                thumbnail = None
+            store.append([thumbnail, self._image_label(img), img.get_id()])
+        ids = [row[2] for row in store]
+        # More slots than images to choose from would only ever stay empty
+        max_slots = min(max_slots, len(candidates))
+
+        # Preselect what was used last time, if the same image is still open
+        last = self.config.get("last_reference_images", [])
+        combos = []
+        rows_box = Gtk.VBox(spacing=4)
+        box.pack_start(rows_box, False, False, 0)
+
+        def taken_elsewhere(combo, image_id):
+            """True if another slot already has this image selected"""
+            if image_id < 0:
+                return False
+            for other in combos:
+                if other is combo:
+                    continue
+                other_iter = other.get_active_iter()
+                if other_iter and store[other_iter][2] == image_id:
+                    return True
+            return False
+
+        def grey_out_taken(combo, cell, model, tree_iter, _data):
+            cell.set_property(
+                "sensitive", not taken_elsewhere(combo, model[tree_iter][2])
+            )
+
+        def remembered_index(slot, combo):
+            """Store row of the image used in this slot last time, or 0"""
+            if slot < len(last) and last[slot]:
+                image_id = last[slot].get("id")
+                if image_id in ids and not taken_elsewhere(combo, image_id):
+                    match = Gimp.Image.get_by_id(image_id)
+                    if match and match.get_name() == last[slot].get("name"):
+                        return ids.index(image_id)
+            return 0
+
+        def add_slot():
+            slot = len(combos)
+            row = Gtk.HBox(spacing=8)
+            label = Gtk.Label(label=f"Reference {slot + 1}:")
+            row.pack_start(label, False, False, 0)
+
+            combo = Gtk.ComboBox.new_with_model(store)
+            pixbuf_cell = Gtk.CellRendererPixbuf()
+            combo.pack_start(pixbuf_cell, False)
+            combo.add_attribute(pixbuf_cell, "pixbuf", 0)
+            text_cell = Gtk.CellRendererText()
+            combo.pack_start(text_cell, True)
+            combo.add_attribute(text_cell, "text", 1)
+            # An image picked in one slot can't be picked again in another
+            combo.set_cell_data_func(pixbuf_cell, grey_out_taken, None)
+            combo.set_cell_data_func(text_cell, grey_out_taken, None)
+            combos.append(combo)
+            combo.set_active(remembered_index(slot, combo))
+
+            row.pack_start(combo, True, True, 0)
+            rows_box.pack_start(row, False, False, 0)
+            row.show_all()
+
+        # Start with the usual slots, or enough to restore last time's choices
+        initial = REFERENCE_INITIAL_SLOTS
+        for slot in range(len(last)):
+            if remembered_index(slot, None):
+                initial = max(initial, slot + 1)
+        for _ in range(min(initial, max_slots)):
+            add_slot()
+
+        def on_add_clicked(_button):
+            add_slot()
+            add_button.set_sensitive(len(combos) < max_slots)
+
+        add_button.connect("clicked", on_add_clicked)
+        add_button.set_sensitive(len(combos) < max_slots)
+        return combos
+
+    def _read_reference_pickers(self, combos):
+        """Selected reference images, in slot order, without duplicates"""
+        if not combos:
+            return []
+
+        selected = []
+        remembered = []
+        for combo in combos:
+            tree_iter = combo.get_active_iter()
+            image_id = combo.get_model()[tree_iter][2] if tree_iter else -1
+            ref = Gimp.Image.get_by_id(image_id) if image_id >= 0 else None
+            if ref and ref.is_valid():
+                remembered.append({"id": image_id, "name": ref.get_name()})
+                if image_id not in [img.get_id() for img in selected]:
+                    selected.append(ref)
+            else:
+                remembered.append(None)
+
+        self.config["last_reference_images"] = remembered
+        return selected
+
+    def _image_label(self, img):
+        """Name as GIMP shows it, plus id and size to tell copies apart"""
+        return f"{img.get_name()}-{img.get_id()}  ({img.get_width()}x{img.get_height()})"
+
+    def _export_references(self, references):
+        """
+        Flatten each reference image (on a copy) to PNG bytes, reduced to
+        REFERENCE_MAX_EDGE. Images that cannot be exported are skipped.
+        """
+        pngs = []
+        for ref in references:
+            if not ref or not ref.is_valid():
+                print("DEBUG: Reference image was closed, skipping")
+                continue
+            temp_image = ref.duplicate()
+            try:
+                if temp_image.get_base_type() != Gimp.ImageBaseType.RGB:
+                    temp_image.convert_rgb()
+                temp_image.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
+
+                width, height = temp_image.get_width(), temp_image.get_height()
+                longest = max(width, height)
+                if longest > REFERENCE_MAX_EDGE:
+                    scale = REFERENCE_MAX_EDGE / longest
+                    Gimp.context_push()
+                    try:
+                        Gimp.context_set_interpolation(Gimp.InterpolationType.LOHALO)
+                        temp_image.scale(
+                            max(1, round(width * scale)), max(1, round(height * scale))
+                        )
+                    finally:
+                        Gimp.context_pop()
+
+                png = self._export_layer_to_png(temp_image)
+                if png:
+                    pngs.append(png)
+                    print(
+                        f"DEBUG: Reference {ref.get_name()} exported "
+                        f"{temp_image.get_width()}x{temp_image.get_height()}, {len(png)} bytes"
+                    )
+            except Exception as e:
+                print(f"DEBUG: Could not export reference {ref.get_name()}: {e}")
+            finally:
+                temp_image.delete()
+        return pngs
+
+    def _prompt_with_reference_note(self, prompt, count):
+        """
+        Tell the model which input image is which when the edited image comes
+        first and the references follow it.
+        """
+        refs = ", ".join(f"reference {i + 1} is image {i + 2}" for i in range(count))
+        return f"{prompt}\n\n(Image 1 is the picture being edited; {refs}.)"
+
+    def _openai_mask_hint(self):
+        """
+        Also show OpenAI the selection as a white-on-black image?
+
+        The 2.x models see the edits mask as a blacked-out hole in the input
+        and paint around it instead of into it, so the selection is sent once
+        more as a picture the model can read. Config: openai.mask_hint.
+        """
+        default = self._get_openai_model() != "gpt-image-1"
+        return bool(self.config.get("openai", {}).get("mask_hint", default))
+
+    def _prompt_with_mask_hint(self, prompt, reference_count):
+        """Point the model at the mask image (image 2); references follow it"""
+        refs = "".join(
+            f" Image {i + 3} is reference {i + 1}." for i in range(reference_count)
+        )
+        return (
+            "Edit image 1 only inside the region shown in white in image 2. "
+            "In image 1 that region may look empty or black: that is not part "
+            "of the picture, it is the area to work on. Fill it completely, "
+            "blend it seamlessly with its surroundings and leave everything "
+            f"outside it unchanged.{refs}\n\n"
+            f"Instruction for the region: {prompt}"
+        )
+
     def _get_provider(self):
         """Which API provider handles inpainting: 'openai' or 'bedrock'"""
         provider = self.config.get("api_provider", "openai")
@@ -335,13 +709,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         print(
                             f"DEBUG: Actually updating progress label to: {encoded_message}"
                         )
-                        progress_label.set_text(encoded_message)
-                        progress_label.set_use_markup(
-                            False
-                        )  # Use plain text, not markup
-                        print(
-                            f"DEBUG: Progress label text is now: {progress_label.get_text()}"
-                        )
+                        self._set_status_text(progress_label, encoded_message)
                         return False  # Remove from idle queue after running once
                     except Exception as e:
                         print(f"DEBUG: UI update failed: {e}")
@@ -349,6 +717,11 @@ class GimpAIPlugin(Gimp.PlugIn):
 
                 # Queue the update on the main thread
                 GLib.idle_add(update_ui)
+
+                # On the main thread, paint it now: the caller is usually about
+                # to do blocking work (exporting images) before the API thread
+                if threading.current_thread() is threading.main_thread():
+                    self._flush_ui()
 
             except Exception as e:
                 print(f"DEBUG: Progress update failed: {e}")
@@ -387,16 +760,150 @@ class GimpAIPlugin(Gimp.PlugIn):
         return progress_callback
 
     def _create_progress_widget(self):
-        """Create progress label widget for dialogs"""
-        progress_label = Gtk.Label()
-        progress_label.set_text("Ready to start...")
-        return progress_label, progress_label
+        """
+        Status box for dialogs: a bold headline (the first line of a message)
+        over the details. Returns (box to pack, headline label); the label is
+        what _update_progress() takes.
+        """
+        box = Gtk.VBox(spacing=4)
+        box.get_style_context().add_class("ai-status")
+
+        headline = Gtk.Label()
+        headline.get_style_context().add_class("ai-status-headline")
+        detail = Gtk.Label()
+        detail.set_no_show_all(True)
+        # Error messages from the APIs can be long; wrap instead of widening.
+        # Selectable so an error can be copied.
+        for label in (headline, detail):
+            label.set_xalign(0.0)
+            label.set_line_wrap(True)
+            label.set_max_width_chars(70)
+            label.set_selectable(True)
+            label.set_can_focus(False)
+            box.pack_start(label, False, False, 0)
+
+        headline._ai_detail = detail
+        headline._ai_box = box
+        self._set_status_text(headline, "Ready to start...")
+        return box, headline
+
+    def _offer_retry(
+        self, progress_label, headline, details="",
+        hint="Adjust the settings and press OK to try again.",
+    ):
+        """
+        Show a failed attempt in the dialog's status box and hand the dialog
+        back to the user through self._retry_dialog, which the dialog that
+        is open sets up. Returns its new result, or None once the user has
+        closed it (the dialog has then destroyed itself).
+        """
+        message = f"❌ {headline}\n" + (f"{details}\n\n" if details else "") + hint
+        self._update_progress(progress_label, message)
+        return self._retry_dialog()
+
+    def _set_status_text(self, progress_label, message):
+        """Show message in a status box, styled by its leading emoji"""
+        detail = getattr(progress_label, "_ai_detail", None)
+        box = getattr(progress_label, "_ai_box", None)
+        if detail is None or box is None:
+            progress_label.set_text(message)
+            return
+
+        first, _, rest = message.partition("\n")
+        progress_label.set_text(first)
+        detail.set_text(rest.strip())
+        detail.set_visible(bool(rest.strip()))
+
+        style = box.get_style_context()
+        style.remove_class("error")
+        style.remove_class("success")
+        if first.startswith(("❌", "⚠")):
+            style.add_class("error")
+        elif first.startswith(("✅", "✓")):
+            style.add_class("success")
 
     def _init_gimp_ui(self):
         """Initialize GIMP UI system if not already done"""
         if not hasattr(self, "_ui_initialized"):
             GimpUi.init("gimp-ai-plugin")
             self._ui_initialized = True
+            try:
+                provider = Gtk.CssProvider()
+                try:
+                    provider.load_from_data(DIALOG_CSS)
+                except GLib.Error:
+                    # Theme without the standard named colours
+                    provider.load_from_data(
+                        DIALOG_CSS.replace(b"@theme_selected_bg_color", b"#4a90d9")
+                        .replace(b"@theme_fg_color", b"#888888")
+                    )
+                Gtk.StyleContext.add_provider_for_screen(
+                    Gdk.Screen.get_default(),
+                    provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+                )
+            except Exception as e:
+                print(f"DEBUG: Dialog CSS not applied: {e}")
+
+    def _section_icon(self, key):
+        """Image for a section header, or None if the theme has no candidate"""
+        theme = Gtk.IconTheme.get_default()
+        for name in SECTION_ICONS.get(key, []):
+            if theme.has_icon(name):
+                image = Gtk.Image.new_from_icon_name(name, Gtk.IconSize.DND)
+                image.set_valign(Gtk.Align.START)
+                image.get_style_context().add_class("ai-section-icon")
+                return image
+        return None
+
+    def _add_section(self, parent, title, subtitle=None, icon=None, badge=None,
+                     separator=True, header_widget=None):
+        """
+        Add a section header (icon, bold title, optional badge and subtitle),
+        preceded by a separator, and return the box for the section's widgets.
+        header_widget (e.g. a button) is placed at the right end of the header.
+        """
+        if separator:
+            sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            sep.set_margin_top(4)
+            sep.set_margin_bottom(4)
+            parent.pack_start(sep, False, False, 0)
+
+        section = Gtk.VBox(spacing=8)
+        parent.pack_start(section, False, False, 0)
+
+        header = Gtk.HBox(spacing=12)
+        section.pack_start(header, False, False, 0)
+        image = self._section_icon(icon) if icon else None
+        if image:
+            header.pack_start(image, False, False, 0)
+
+        text = Gtk.VBox(spacing=2)
+        header.pack_start(text, True, True, 0)
+        title_row = Gtk.HBox(spacing=10)
+        text.pack_start(title_row, False, False, 0)
+        title_label = Gtk.Label(label=title)
+        title_label.set_xalign(0.0)
+        title_label.get_style_context().add_class("ai-section-title")
+        title_row.pack_start(title_label, False, False, 0)
+        if badge:
+            badge_label = Gtk.Label(label=badge)
+            badge_label.set_valign(Gtk.Align.CENTER)
+            badge_label.get_style_context().add_class("ai-badge")
+            title_row.pack_start(badge_label, False, False, 0)
+        if subtitle:
+            subtitle_label = Gtk.Label(label=subtitle)
+            subtitle_label.set_xalign(0.0)
+            subtitle_label.set_line_wrap(True)
+            subtitle_label.get_style_context().add_class("ai-section-subtitle")
+            text.pack_start(subtitle_label, False, False, 0)
+        if header_widget:
+            header_widget.set_valign(Gtk.Align.CENTER)
+            header.pack_end(header_widget, False, False, 0)
+
+        body = Gtk.VBox(spacing=8)
+        section.pack_start(body, False, False, 0)
+        return body
 
     def _create_dialog_base(self, title="Dialog", size=(500, 400)):
         """Create a standard GIMP dialog with consistent styling"""
@@ -407,6 +914,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             "gtk-dialogs-use-header"
         )
         dialog = GimpUi.Dialog(use_header_bar=use_header_bar, title=title)
+        dialog.get_style_context().add_class("ai-dialog")
 
         # Set up dialog properties
         dialog.set_default_size(size[0], size[1])
@@ -465,6 +973,127 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         return api_warning_bar, True
 
+    def _model_info_rows(self, operation, variant=None):
+        """
+        (label, value) rows naming the model and main parameters an operation
+        will send: 'generate', 'inpaint', 'composite', 'erase' or 'upscale'.
+        Read from config the same way the API calls read it, so the box shows
+        what is actually sent.
+        """
+        if self._get_provider() != "bedrock":
+            model = self._get_openai_model()
+            labels = dict(OPENAI_IMAGE_MODELS)
+            params = ["quality high", "1 image"]
+            if operation in ("inpaint", "composite"):
+                params.append("moderation low")
+                params.append(
+                    "input fidelity high"
+                    if model == "gpt-image-1"
+                    else "high fidelity (built in)"
+                )
+            return [
+                ("Provider", "OpenAI"),
+                ("Model", labels.get(model, model)),
+                ("Parameters", ", ".join(params)),
+            ]
+
+        cfg = self.config.get("bedrock", {})
+        if operation == "upscale":
+            variant = variant or cfg.get("upscale_variant", "conservative")
+            if variant not in bedrock_client.UPSCALE_VARIANTS:
+                variant = "conservative"
+            model_id = bedrock_client.UPSCALE_VARIANTS[variant]["model_id"]
+            get_creds = lambda c: bedrock_client.upscale_credentials(c, variant)
+        elif operation == "erase":
+            model_id = cfg.get("erase_model_id") or bedrock_client.DEFAULT_ERASE_MODEL_ID
+            get_creds = bedrock_client.erase_credentials
+        elif operation == "generate":
+            model_id = (
+                cfg.get("generation_model_id")
+                or bedrock_client.DEFAULT_GENERATION_MODEL_ID
+            )
+            get_creds = bedrock_client.generation_credentials
+        else:
+            model_id = cfg.get("model_id") or bedrock_client.DEFAULT_MODEL_ID
+            get_creds = bedrock_client.resolve_credentials
+
+        # Credentials also settle the region and inference-profile prefix;
+        # without them the warning bar already says what is missing
+        region = "not configured"
+        try:
+            creds = get_creds(cfg)
+            model_id, region = creds["model_id"], creds["region"]
+        except bedrock_client.BedrockError:
+            pass
+
+        seed = int(cfg.get("seed", 0))
+        seed_text = f"seed {seed}" if seed else "random seed"
+        grow_text = f"grow mask {cfg.get('grow_mask', 5)}px"
+        params = []
+        if operation in ("inpaint", "erase"):
+            count = cfg.get(f"{operation}_variations", 3)
+            count = max(1, min(4, int(count)))
+            params += [f"{count} variations (random seeds)", grow_text]
+        elif operation == "composite":
+            params += [seed_text, grow_text]
+        elif operation == "generate":
+            params += [seed_text, "aspect ratio from size"]
+        elif operation == "upscale":
+            if bedrock_client.UPSCALE_VARIANTS[variant]["needs_prompt"]:
+                creativity = max(0.1, min(0.5, float(cfg.get("upscale_creativity", 0.35))))
+                params += [f"creativity {creativity:.2f}", seed_text]
+            else:
+                params.append("exactly 4x")
+            params.append("WebP output")
+
+        rows = [
+            ("Provider", "Amazon Bedrock"),
+            ("Model", model_id),
+            ("Region", region),
+            ("Parameters", ", ".join(params)),
+        ]
+        negative = cfg.get("negative_prompt", "")
+        if negative and operation in ("inpaint", "composite", "generate"):
+            short = negative if len(negative) <= 50 else negative[:50] + "..."
+            rows.append(("Negative prompt", short))
+        return rows
+
+    def _add_model_info_box(self, content_area, operation, variant=None):
+        """
+        Add one dim line naming the model and main parameters the operation
+        will use. Returns refresh(variant=None) to call after Settings closes or
+        the upscale variant changes.
+        """
+        label = Gtk.Label()
+        label.set_xalign(0.0)
+        label.set_line_wrap(True)
+        label.set_selectable(True)
+        label.get_style_context().add_class("dim-label")
+        content_area.pack_start(label, False, False, 0)
+
+        # The upscale variant changes with its combo; Settings refreshes keep it
+        state = {"variant": variant}
+
+        def refresh(new_variant=None):
+            if new_variant:
+                state["variant"] = new_variant
+            try:
+                rows = self._model_info_rows(operation, state["variant"])
+            except Exception as e:
+                print(f"DEBUG: Model info unavailable: {e}")
+                rows = [("Model", "unknown")]
+            # Provider, model and parameters read on their own; the rest
+            # need their name to make sense
+            parts = [
+                value if key in ("Provider", "Model", "Parameters")
+                else f"{key.lower()}: {value}"
+                for key, value in rows
+            ]
+            label.set_text("Uses: " + " · ".join(parts))
+
+        refresh()
+        return refresh
+
     def _is_debug_mode(self):
         """Check if debug mode is enabled (saves temp files to system temp directory)"""
         # Check config first
@@ -473,6 +1102,21 @@ class GimpAIPlugin(Gimp.PlugIn):
         if os.environ.get("GIMP_AI_DEBUG") == "1":
             debug = True
         return debug
+
+    def _flush_ui(self):
+        """Process all pending GTK events so queued widget changes get painted"""
+        if getattr(self, "_flushing_ui", False):
+            return  # Already inside a flush (e.g. called from an idle callback)
+        self._flushing_ui = True
+        try:
+            event_count = 0
+            while Gtk.events_pending() and event_count < 100:
+                Gtk.main_iteration_do(False)
+                event_count += 1
+        except Exception as e:
+            print(f"DEBUG: GTK flush warning (non-fatal): {e}")
+        finally:
+            self._flushing_ui = False
 
     def _check_cancel_and_process_events(self):
         """Check if cancel was requested and process minimal UI events"""
@@ -498,8 +1142,22 @@ class GimpAIPlugin(Gimp.PlugIn):
         show_mode_selection=True,
         image=None,
         provider="openai",
+        size_presets=None,
+        allow_custom_size=False,
+        show_references=False,
+        operation="generate",
     ):
-        """Show a GIMP UI dialog to get user input for AI prompt"""
+        """
+        Show a GIMP UI dialog to get user input for AI prompt.
+
+        operation: 'generate' or 'inpaint', for the model & parameters box.
+
+        size_presets: [(label, (w, h))] adds an image size picker (used when
+        generating a new image); the choice is left in self._dialog_size.
+        show_references: adds pickers for reference images taken from the
+        other open images (not `image`); the choice is left in
+        self._dialog_references as a list of Gimp.Image.
+        """
         # Use last prompt as default if available, otherwise use provided default
         if not default_text:
             default_text = self._get_last_prompt()
@@ -520,14 +1178,10 @@ class GimpAIPlugin(Gimp.PlugIn):
             ok_button = dialog.add_button("OK", Gtk.ResponseType.OK)
             ok_button.set_can_default(True)
             ok_button.grab_default()
+            ok_button.get_style_context().add_class("suggested-action")
 
             # Set up content area using helper
             content_area = self._setup_dialog_content_area(dialog, spacing=10)
-
-            # Label - will automatically use theme colors
-            label = Gtk.Label(label="Enter your AI prompt:")
-            label.set_halign(Gtk.Align.START)
-            content_area.pack_start(label, False, False, 0)
 
             # Add API warning bar using helper
             api_warning_bar, needs_config = self._add_api_warning_bar(
@@ -538,13 +1192,28 @@ class GimpAIPlugin(Gimp.PlugIn):
                 ok_button.set_sensitive(False)
                 ok_button.set_label("Configure & Continue")
 
+            # Sections are numbered in the order they appear
+            section_number = [0]
+
+            def numbered(text):
+                section_number[0] += 1
+                return f"{section_number[0]}. {text}"
+
+            prompt_box = self._add_section(
+                content_area, numbered("Prompt"),
+                "Describe the change you want in the selected area."
+                if operation == "inpaint"
+                else "Describe the image you want to generate.",
+                icon="prompt", separator=False,
+            )
+
             # Prompt history dropdown
             history = self._get_prompt_history()
             history_combo = None
             if history:
                 history_label = Gtk.Label(label="Recent prompts:")
                 history_label.set_halign(Gtk.Align.START)
-                content_area.pack_start(history_label, False, False, 0)
+                prompt_box.pack_start(history_label, False, False, 0)
 
                 history_combo = Gtk.ComboBoxText()
                 history_combo.append_text("Select from recent prompts...")
@@ -553,14 +1222,16 @@ class GimpAIPlugin(Gimp.PlugIn):
                     display_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
                     history_combo.append_text(display_prompt)
                 history_combo.set_active(0)
-                content_area.pack_start(history_combo, False, False, 0)
+                prompt_box.pack_start(history_combo, False, False, 0)
 
             # Multiline text view for prompts
             scrolled_window = Gtk.ScrolledWindow()
             scrolled_window.set_policy(
                 Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
             )
-            scrolled_window.set_size_request(560, 150)
+            scrolled_window.set_shadow_type(Gtk.ShadowType.IN)
+            scrolled_window.get_style_context().add_class("ai-prompt-frame")
+            scrolled_window.set_size_request(560, 120)
 
             text_view = Gtk.TextView()
             text_view.set_wrap_mode(Gtk.WrapMode.WORD)
@@ -571,22 +1242,17 @@ class GimpAIPlugin(Gimp.PlugIn):
             text_buffer.set_text(default_text)
 
             scrolled_window.add(text_view)
-            content_area.pack_start(scrolled_window, True, True, 0)
+            prompt_box.pack_start(scrolled_window, True, True, 0)
 
             # Add mode selection (only for inpainting)
             focused_radio = None
             full_radio = None
             if show_mode_selection:
-                mode_frame = Gtk.Frame(label="Processing Mode:")
-                mode_frame.set_margin_top(10)
-                content_area.pack_start(mode_frame, False, False, 0)
-
-                mode_box = Gtk.VBox()
-                mode_box.set_margin_start(10)
-                mode_box.set_margin_end(10)
-                mode_box.set_margin_top(5)
-                mode_box.set_margin_bottom(10)
-                mode_frame.add(mode_box)
+                mode_box = self._add_section(
+                    content_area, numbered("Processing Mode"),
+                    "How much of the image the model gets to see.",
+                    icon="mode",
+                )
 
                 # Get last used mode from config
                 config = self._load_config()
@@ -612,6 +1278,87 @@ class GimpAIPlugin(Gimp.PlugIn):
                     full_radio.set_active(True)
                 else:
                     focused_radio.set_active(True)
+
+                # The selection always goes to the API as the mask; this only
+                # decides whether the result layer's mask is applied afterwards
+                clip_checkbox = Gtk.CheckButton()
+                clip_checkbox.set_label(
+                    "Clip result to selection (untick to keep edges the model drew outside)"
+                )
+                clip_checkbox.set_active(self.config.get("clip_to_selection", True))
+                mode_box.pack_start(clip_checkbox, False, False, 6)
+
+            # Image size picker (only when generating a new image)
+            size_combo = None
+            if size_presets:
+                size_vbox = self._add_section(
+                    content_area, numbered("Image Size"),
+                    "Choose the size of the generated image.",
+                    icon="size",
+                )
+
+                size_row = Gtk.HBox(spacing=8)
+                size_vbox.pack_start(size_row, False, False, 0)
+
+                size_combo = Gtk.ComboBoxText()
+                for size_label, _ in size_presets:
+                    size_combo.append_text(size_label)
+                if allow_custom_size:
+                    size_combo.append_text("Custom")
+                size_row.pack_start(size_combo, True, True, 0)
+
+                width_spin = Gtk.SpinButton.new_with_range(16, 3840, 16)
+                height_spin = Gtk.SpinButton.new_with_range(16, 3840, 16)
+                size_row.pack_start(width_spin, False, False, 0)
+                size_row.pack_start(Gtk.Label(label="×"), False, False, 0)
+                size_row.pack_start(height_spin, False, False, 0)
+
+                size_note = Gtk.Label(
+                    label="Sizes are rounded to what the model accepts"
+                    if allow_custom_size
+                    else "The model picks the exact size for this shape"
+                )
+                size_note.set_halign(Gtk.Align.START)
+                size_note.get_style_context().add_class("dim-label")
+                size_vbox.pack_start(size_note, False, False, 0)
+
+                preset_sizes = [tuple(size) for _, size in size_presets]
+                last_size = tuple(
+                    self.config.get("last_generate_size", preset_sizes[0])
+                )
+                width_spin.set_value(last_size[0])
+                height_spin.set_value(last_size[1])
+
+                def on_size_changed(combo):
+                    index = combo.get_active()
+                    custom = index >= len(size_presets)
+                    if 0 <= index < len(size_presets):
+                        preset_w, preset_h = size_presets[index][1]
+                        width_spin.set_value(preset_w)
+                        height_spin.set_value(preset_h)
+                    width_spin.set_sensitive(custom)
+                    height_spin.set_sensitive(custom)
+
+                size_combo.connect("changed", on_size_changed)
+                if last_size in preset_sizes:
+                    size_combo.set_active(preset_sizes.index(last_size))
+                elif allow_custom_size:
+                    size_combo.set_active(len(size_presets))
+                else:
+                    size_combo.set_active(0)
+
+            # Reference image pickers (OpenAI only)
+            reference_combos = []
+            if show_references:
+                # When inpainting, the edited image (and the mask hint, if
+                # sent) go first and count towards the API's input image limit
+                reserved = 0
+                if operation == "inpaint":
+                    reserved = 2 if self._openai_mask_hint() else 1
+                reference_combos = self._add_reference_pickers(
+                    content_area, image, numbered("Reference Images"),
+                    max_slots=OPENAI_MAX_INPUT_IMAGES - reserved,
+                )
 
             # Connect Enter to activate OK button, Shift+Enter for new line
             def on_key_press(widget, event):
@@ -644,9 +1391,14 @@ class GimpAIPlugin(Gimp.PlugIn):
 
                 history_combo.connect("changed", on_history_changed)
 
+            status_box = self._add_section(
+                content_area, "Status", icon="status"
+            )
+            refresh_model_info = self._add_model_info_box(status_box, operation)
+
             # Add progress widget
             progress_frame, progress_label = self._create_progress_widget()
-            content_area.pack_start(progress_frame, False, False, 0)
+            status_box.pack_start(progress_frame, False, False, 0)
 
             # Show all widgets
             content_area.show_all()
@@ -657,26 +1409,135 @@ class GimpAIPlugin(Gimp.PlugIn):
                 text_buffer.get_start_iter(), text_buffer.get_end_iter()
             )
 
-            # Run dialog in loop to handle Settings button
-            print("DEBUG: About to call dialog.run()...")
-            while True:
-                response = dialog.run()
-                print(f"DEBUG: Dialog response: {response}")
+            # Keeps the dialog responsive to Cancel while the request runs
+            def on_dialog_response(dialog, response_id):
+                if response_id == Gtk.ResponseType.CANCEL:
+                    print("DEBUG: Cancel button clicked during processing")
+                    self._cancel_requested = True
+                    return True  # Keep dialog open
+                return False
 
-                if response == Gtk.ResponseType.OK:
-                    # First check credentials are configured (for "Configure & Continue" button)
-                    if not self._credentials_ready(provider):
+            dialog.connect("response", on_dialog_response)
+
+            # Run dialog in loop to handle Settings button
+            def wait_for_prompt():
+                nonlocal provider
+                while True:
+                    response = dialog.run()
+                    print(f"DEBUG: Dialog response: {response}")
+
+                    if response == Gtk.ResponseType.OK:
+                        # First check credentials are configured (for "Configure & Continue" button)
+                        if not self._credentials_ready(provider):
+                            print(
+                                f"DEBUG: OK clicked but {provider} not configured, opening settings"
+                            )
+                            self._show_settings_dialog(dialog)
+
+                            # The settings dialog can change the provider itself
+                            provider = self._get_provider()
+                            refresh_model_info()
+
+                            # Re-check credentials after settings dialog
+                            if self._credentials_ready(provider):
+                                # API key now configured - update UI
+                                if api_warning_bar:
+                                    api_warning_bar.hide()
+                                ok_button.set_sensitive(True)
+                                ok_button.set_label("OK")
+                                print(f"DEBUG: {provider} configured, enabled OK button")
+                            else:
+                                print(f"DEBUG: {provider} still not configured")
+                                continue  # Keep dialog open
+
+                        # Now validate the prompt
+                        start_iter = text_buffer.get_start_iter()
+                        end_iter = text_buffer.get_end_iter()
+                        prompt = text_buffer.get_text(start_iter, end_iter, False).strip()
+
+                        # Check if user entered actual content (not just placeholder)
+                        placeholder_texts = [
+                            "Describe what you want to generate...",
+                            "Describe the area to inpaint (e.g. 'remove object', 'fix background')",
+                        ]
+
+                        is_placeholder = prompt in placeholder_texts or not prompt.strip()
+
+                        if is_placeholder:
+                            # Show error message and keep dialog open
+                            error_dialog = Gtk.MessageDialog(
+                                parent=dialog,
+                                flags=Gtk.DialogFlags.MODAL,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK,
+                                text="Please enter a prompt description",
+                            )
+                            error_dialog.format_secondary_text(
+                                "You need to describe what you want to generate or change before proceeding."
+                            )
+                            error_dialog.run()
+                            error_dialog.destroy()
+                            continue  # Keep the main dialog open
+
+                        # Get selected mode
+                        selected_mode = "contextual"  # default
+                        if show_mode_selection and full_radio and full_radio.get_active():
+                            selected_mode = "full_image"
+                        elif (
+                            show_mode_selection
+                            and focused_radio
+                            and focused_radio.get_active()
+                        ):
+                            selected_mode = "contextual"
+                        # If no mode selection UI, use default "contextual" (for image generator)
+
                         print(
-                            f"DEBUG: OK clicked but {provider} not configured, opening settings"
+                            f"DEBUG: Got prompt text: '{prompt}', mode: '{selected_mode}', disabling OK button..."
                         )
+                        # Disable OK button to prevent multiple clicks
+                        ok_button.set_sensitive(False)
+                        ok_button.set_label("Processing...")
+
+                        # Update progress
+                        self._update_progress(progress_label, "Validating API key...")
+
+                        if size_combo:
+                            self._dialog_size = (
+                                int(width_spin.get_value()),
+                                int(height_spin.get_value()),
+                            )
+                            self.config["last_generate_size"] = list(self._dialog_size)
+
+                        self._dialog_references = self._read_reference_pickers(
+                            reference_combos
+                        )
+
+                        if prompt:
+                            self._add_to_prompt_history(prompt)
+                            # Save the selected mode to config
+                            self.config["last_mode"] = selected_mode
+                            if show_mode_selection:
+                                self.config["clip_to_selection"] = clip_checkbox.get_active()
+                            self._save_config()
+
+                        # Reset cancel flag for new operation
+                        self._cancel_requested = False
+
+                        # Return dialog, progress_label, and prompt data for processing
+                        return (
+                            (dialog, progress_label, prompt, selected_mode)
+                            if prompt
+                            else None
+                        )
+                    elif response == Gtk.ResponseType.APPLY:  # Configure Now button
+                        print("DEBUG: Configure Now button clicked")
                         self._show_settings_dialog(dialog)
 
-                        # The settings dialog can change the provider itself
-                        provider = self._get_provider()
-
                         # Re-check credentials after settings dialog
+                        provider = self._get_provider()
+                        refresh_model_info()
                         if self._credentials_ready(provider):
-                            # API key now configured - update UI
+                            # Credentials now configured - update UI
                             if api_warning_bar:
                                 api_warning_bar.hide()
                             ok_button.set_sensitive(True)
@@ -684,109 +1545,30 @@ class GimpAIPlugin(Gimp.PlugIn):
                             print(f"DEBUG: {provider} configured, enabled OK button")
                         else:
                             print(f"DEBUG: {provider} still not configured")
-                            continue  # Keep dialog open
-
-                    # Now validate the prompt
-                    start_iter = text_buffer.get_start_iter()
-                    end_iter = text_buffer.get_end_iter()
-                    prompt = text_buffer.get_text(start_iter, end_iter, False).strip()
-
-                    # Check if user entered actual content (not just placeholder)
-                    placeholder_texts = [
-                        "Describe what you want to generate...",
-                        "Describe the area to inpaint (e.g. 'remove object', 'fix background')",
-                    ]
-
-                    is_placeholder = prompt in placeholder_texts or not prompt.strip()
-
-                    if is_placeholder:
-                        # Show error message and keep dialog open
-                        error_dialog = Gtk.MessageDialog(
-                            parent=dialog,
-                            flags=Gtk.DialogFlags.MODAL,
-                            message_type=Gtk.MessageType.WARNING,
-                            buttons=Gtk.ButtonsType.OK,
-                            text="Please enter a prompt description",
-                        )
-                        error_dialog.format_secondary_text(
-                            "You need to describe what you want to generate or change before proceeding."
-                        )
-                        error_dialog.run()
-                        error_dialog.destroy()
-                        continue  # Keep the main dialog open
-
-                    # Get selected mode
-                    selected_mode = "contextual"  # default
-                    if show_mode_selection and full_radio and full_radio.get_active():
-                        selected_mode = "full_image"
-                    elif (
-                        show_mode_selection
-                        and focused_radio
-                        and focused_radio.get_active()
-                    ):
-                        selected_mode = "contextual"
-                    # If no mode selection UI, use default "contextual" (for image generator)
-
-                    print(
-                        f"DEBUG: Got prompt text: '{prompt}', mode: '{selected_mode}', disabling OK button..."
-                    )
-                    # Disable OK button to prevent multiple clicks
-                    ok_button.set_sensitive(False)
-                    ok_button.set_label("Processing...")
-
-                    # Update progress
-                    self._update_progress(progress_label, "Validating API key...")
-
-                    if prompt:
-                        self._add_to_prompt_history(prompt)
-                        # Save the selected mode to config
-                        self.config["last_mode"] = selected_mode
-                        self._save_config()
-
-                    # Reset cancel flag for new operation
-                    self._cancel_requested = False
-
-                    # Add cancel handler to keep dialog responsive during processing
-                    def on_dialog_response(dialog, response_id):
-                        if response_id == Gtk.ResponseType.CANCEL:
-                            print("DEBUG: Cancel button clicked during processing")
-                            self._cancel_requested = True
-                            return True  # Keep dialog open
-                        return False
-
-                    dialog.connect("response", on_dialog_response)
-
-                    # Return dialog, progress_label, and prompt data for processing
-                    return (
-                        (dialog, progress_label, prompt, selected_mode)
-                        if prompt
-                        else None
-                    )
-                elif response == Gtk.ResponseType.APPLY:  # Configure Now button
-                    print("DEBUG: Configure Now button clicked")
-                    self._show_settings_dialog(dialog)
-
-                    # Re-check credentials after settings dialog
-                    provider = self._get_provider()
-                    if self._credentials_ready(provider):
-                        # Credentials now configured - update UI
-                        if api_warning_bar:
-                            api_warning_bar.hide()
-                        ok_button.set_sensitive(True)
-                        ok_button.set_label("OK")
-                        print(f"DEBUG: {provider} configured, enabled OK button")
+                        # Continue loop to keep main dialog open
+                    elif response == Gtk.ResponseType.HELP:  # Settings button
+                        print("DEBUG: Settings button clicked")
+                        self._show_settings_dialog(dialog)
+                        provider = self._get_provider()
+                        refresh_model_info()
+                        # Continue loop to keep main dialog open
                     else:
-                        print(f"DEBUG: {provider} still not configured")
-                    # Continue loop to keep main dialog open
-                elif response == Gtk.ResponseType.HELP:  # Settings button
-                    print("DEBUG: Settings button clicked")
-                    self._show_settings_dialog(dialog)
-                    provider = self._get_provider()
-                    # Continue loop to keep main dialog open
-                else:
-                    print("DEBUG: Dialog cancelled, destroying...")
-                    dialog.destroy()
-                    return None
+                        print("DEBUG: Dialog cancelled, destroying...")
+                        dialog.destroy()
+                        return None
+
+            # Lets the caller hand the dialog back to the user after a failed
+            # attempt, keeping the prompt and options they entered
+            def retry_dialog():
+                ok_button.set_sensitive(True)
+                ok_button.set_label("OK")
+                text_view.grab_focus()
+                return wait_for_prompt()
+
+            self._retry_dialog = retry_dialog
+
+            print("DEBUG: About to call dialog.run()...")
+            return wait_for_prompt()
 
         except Exception as e:
             print(f"DEBUG: Dialog error: {e}")
@@ -833,22 +1615,10 @@ class GimpAIPlugin(Gimp.PlugIn):
             ok_button = dialog.add_button("Composite Layers", Gtk.ResponseType.OK)
             ok_button.set_can_default(True)
             ok_button.grab_default()
+            ok_button.get_style_context().add_class("suggested-action")
 
             # Set up content area using helper
-            content_area = self._setup_dialog_content_area(dialog)
-
-            # Title and info
-            title_label = Gtk.Label()
-            title_label.set_markup("<b>Layer Composite</b>")
-            title_label.set_halign(Gtk.Align.START)
-            content_area.pack_start(title_label, False, False, 0)
-
-            info_label = Gtk.Label()
-            info_label.set_text(
-                f"Will composite {len(visible_layers)} visible layers using AI:"
-            )
-            info_label.set_halign(Gtk.Align.START)
-            content_area.pack_start(info_label, False, False, 0)
+            content_area = self._setup_dialog_content_area(dialog, spacing=10)
 
             # Add API warning bar using helper
             api_warning_bar, needs_config = self._add_api_warning_bar(
@@ -860,15 +1630,12 @@ class GimpAIPlugin(Gimp.PlugIn):
                 ok_button.set_label("Configure & Continue")
 
             # Layer list (read-only, just for user info)
-            layer_frame = Gtk.Frame(label="Layers to composite:")
-            content_area.pack_start(layer_frame, False, False, 5)
-
-            layer_box = Gtk.VBox()
-            layer_box.set_margin_start(10)
-            layer_box.set_margin_end(10)
-            layer_box.set_margin_top(5)
-            layer_box.set_margin_bottom(10)
-            layer_frame.add(layer_box)
+            layer_box = self._add_section(
+                content_area, "1. Layers",
+                f"{len(visible_layers)} visible layers will be combined by AI.",
+                icon="layers", separator=False,
+            )
+            layer_box.set_spacing(2)
 
             for i, layer in enumerate(visible_layers):
                 layer_label = Gtk.Label()
@@ -881,7 +1648,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                         f"Layer {len(visible_layers) - 1 - i}: {layer.get_name()}"
                     )
                 layer_label.set_halign(Gtk.Align.START)
-                layer_box.pack_start(layer_label, False, False, 2)
+                layer_box.pack_start(layer_label, False, False, 0)
+
+            prompt_box = self._add_section(
+                content_area, "2. Prompt",
+                "Describe how to combine these layers.",
+                icon="prompt",
+            )
 
             # Prompt history dropdown
             history = self._get_prompt_history()
@@ -889,7 +1662,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             if history:
                 history_label = Gtk.Label(label="Recent prompts:")
                 history_label.set_halign(Gtk.Align.START)
-                content_area.pack_start(history_label, False, False, 0)
+                prompt_box.pack_start(history_label, False, False, 0)
 
                 history_combo = Gtk.ComboBoxText()
                 history_combo.append_text("Select from recent prompts...")
@@ -898,18 +1671,15 @@ class GimpAIPlugin(Gimp.PlugIn):
                     display_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
                     history_combo.append_text(display_prompt)
                 history_combo.set_active(0)
-                content_area.pack_start(history_combo, False, False, 0)
-
-            # Prompt text area
-            prompt_label = Gtk.Label(label="Describe how to combine these layers:")
-            prompt_label.set_halign(Gtk.Align.START)
-            content_area.pack_start(prompt_label, False, False, 0)
+                prompt_box.pack_start(history_combo, False, False, 0)
 
             scrolled_window = Gtk.ScrolledWindow()
             scrolled_window.set_policy(
                 Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
             )
-            scrolled_window.set_min_content_height(100)
+            scrolled_window.set_shadow_type(Gtk.ShadowType.IN)
+            scrolled_window.get_style_context().add_class("ai-prompt-frame")
+            scrolled_window.set_size_request(520, 100)
 
             text_view = Gtk.TextView()
             text_view.set_wrap_mode(Gtk.WrapMode.WORD)
@@ -923,7 +1693,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             text_buffer.set_text(default_prompt)
 
             scrolled_window.add(text_view)
-            content_area.pack_start(scrolled_window, True, True, 0)
+            prompt_box.pack_start(scrolled_window, True, True, 0)
 
             # Connect history selection to populate text view
             if history_combo:
@@ -943,125 +1713,149 @@ class GimpAIPlugin(Gimp.PlugIn):
                 history_combo.connect("changed", on_history_changed)
 
             # Mask option - restore from config
+            mask_box = self._add_section(
+                content_area, "3. Selection Mask",
+                "Limit the change to the selected area.",
+                icon="mask", badge="Optional",
+            )
             mask_checkbox = Gtk.CheckButton()
             mask_checkbox.set_label("Include selection mask (applies to base layer)")
             last_use_mask = self.config.get("last_use_mask", False)
             mask_checkbox.set_active(last_use_mask)
-            content_area.pack_start(mask_checkbox, False, False, 5)
+            mask_box.pack_start(mask_checkbox, False, False, 0)
+
+            status_box = self._add_section(content_area, "Status", icon="status")
+            refresh_model_info = self._add_model_info_box(status_box, "composite")
 
             # Add progress widget
             progress_frame, progress_label = self._create_progress_widget()
-            content_area.pack_start(progress_frame, False, False, 0)
+            status_box.pack_start(progress_frame, False, False, 0)
 
             # Show dialog
             content_area.show_all()
             text_view.grab_focus()
 
+            # Keeps the dialog responsive to Cancel while the request runs
+            def on_dialog_response(dialog, response_id):
+                if response_id == Gtk.ResponseType.CANCEL:
+                    print("DEBUG: Cancel button clicked during processing")
+                    self._cancel_requested = True
+                    return True  # Keep dialog open
+                return False
+
+            dialog.connect("response", on_dialog_response)
+
             # Run dialog loop
-            while True:
-                response = dialog.run()
+            def wait_for_prompt():
+                nonlocal provider
+                while True:
+                    response = dialog.run()
 
-                if response == Gtk.ResponseType.OK:
-                    # Get prompt text
-                    start_iter = text_buffer.get_start_iter()
-                    end_iter = text_buffer.get_end_iter()
-                    prompt = text_buffer.get_text(start_iter, end_iter, False)
+                    if response == Gtk.ResponseType.OK:
+                        # Get prompt text
+                        start_iter = text_buffer.get_start_iter()
+                        end_iter = text_buffer.get_end_iter()
+                        prompt = text_buffer.get_text(start_iter, end_iter, False)
 
-                    # Check if user entered actual content (not just placeholder)
-                    placeholder_texts = [
-                        "Combine these layers naturally into a cohesive image",
-                        "Describe what you want to generate...",
-                    ]
+                        # Check if user entered actual content (not just placeholder)
+                        placeholder_texts = [
+                            "Combine these layers naturally into a cohesive image",
+                            "Describe what you want to generate...",
+                        ]
 
-                    is_placeholder = prompt in placeholder_texts or not prompt.strip()
+                        is_placeholder = prompt in placeholder_texts or not prompt.strip()
 
-                    if is_placeholder:
-                        # Show error
-                        error_dialog = Gtk.MessageDialog(
-                            parent=dialog,
-                            flags=Gtk.DialogFlags.MODAL,
-                            message_type=Gtk.MessageType.WARNING,
-                            buttons=Gtk.ButtonsType.OK,
-                            text="Please enter a prompt description",
+                        if is_placeholder:
+                            # Show error
+                            error_dialog = Gtk.MessageDialog(
+                                parent=dialog,
+                                flags=Gtk.DialogFlags.MODAL,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK,
+                                text="Please enter a prompt description",
+                            )
+                            error_dialog.run()
+                            error_dialog.destroy()
+                            continue
+
+                        use_mask = mask_checkbox.get_active()
+                        print(
+                            f"DEBUG: Composite dialog OK - {len(visible_layers)} layers, mask: {use_mask}"
                         )
-                        error_dialog.run()
-                        error_dialog.destroy()
-                        continue
 
-                    use_mask = mask_checkbox.get_active()
-                    print(
-                        f"DEBUG: Composite dialog OK - {len(visible_layers)} layers, mask: {use_mask}"
-                    )
+                        # Save mask checkbox state to config
+                        self.config["last_use_mask"] = use_mask
+                        self._save_config()
 
-                    # Save mask checkbox state to config
-                    self.config["last_use_mask"] = use_mask
-                    self._save_config()
+                        # Disable OK button to prevent multiple clicks
+                        ok_button.set_sensitive(False)
+                        ok_button.set_label("Processing...")
 
-                    # Disable OK button to prevent multiple clicks
-                    ok_button.set_sensitive(False)
-                    ok_button.set_label("Processing...")
+                        # Update progress
+                        self._update_progress(progress_label, "Validating API key...")
 
-                    # Update progress
-                    self._update_progress(progress_label, "Validating API key...")
+                        # Save prompt to history
+                        self._add_to_prompt_history(prompt.strip())
 
-                    # Save prompt to history
-                    self._add_to_prompt_history(prompt.strip())
+                        # Reset cancel flag for new operation
+                        self._cancel_requested = False
 
-                    # Reset cancel flag for new operation
-                    self._cancel_requested = False
+                        # Return dialog, progress_label, and data for processing
+                        return (
+                            dialog,
+                            progress_label,
+                            prompt.strip(),
+                            visible_layers,
+                            use_mask,
+                        )
 
-                    # Add cancel handler to keep dialog responsive during processing
-                    def on_dialog_response(dialog, response_id):
-                        if response_id == Gtk.ResponseType.CANCEL:
-                            print("DEBUG: Cancel button clicked during processing")
-                            self._cancel_requested = True
-                            return True  # Keep dialog open
-                        return False
+                    elif response == Gtk.ResponseType.HELP:
+                        print("DEBUG: Settings button clicked")
+                        # Show settings dialog
+                        self._show_settings_dialog(dialog)
+                        # Check if credentials were configured
+                        provider = self._get_provider()
+                        refresh_model_info()
+                        if self._credentials_ready(provider):
+                            print(f"DEBUG: {provider} configured, enabled OK button")
+                            ok_button.set_sensitive(True)
+                            ok_button.set_label("Composite Layers")
+                            if api_warning_bar:
+                                api_warning_bar.hide()
+                        else:
+                            print(f"DEBUG: {provider} still not configured")
 
-                    dialog.connect("response", on_dialog_response)
+                    elif response == Gtk.ResponseType.APPLY:
+                        print("DEBUG: Configure Now button clicked")
+                        # Show settings dialog when "Configure Now" is clicked
+                        self._show_settings_dialog(dialog)
+                        # Check if credentials were configured
+                        provider = self._get_provider()
+                        refresh_model_info()
+                        if self._credentials_ready(provider):
+                            print(f"DEBUG: {provider} configured, enabled OK button")
+                            ok_button.set_sensitive(True)
+                            ok_button.set_label("Composite Layers")
+                            if api_warning_bar:
+                                api_warning_bar.hide()
+                        else:
+                            print(f"DEBUG: {provider} still not configured")
 
-                    # Return dialog, progress_label, and data for processing
-                    return (
-                        dialog,
-                        progress_label,
-                        prompt.strip(),
-                        visible_layers,
-                        use_mask,
-                    )
-
-                elif response == Gtk.ResponseType.HELP:
-                    print("DEBUG: Settings button clicked")
-                    # Show settings dialog
-                    self._show_settings_dialog(dialog)
-                    # Check if credentials were configured
-                    provider = self._get_provider()
-                    if self._credentials_ready(provider):
-                        print(f"DEBUG: {provider} configured, enabled OK button")
-                        ok_button.set_sensitive(True)
-                        ok_button.set_label("Composite Layers")
-                        if api_warning_bar:
-                            api_warning_bar.hide()
                     else:
-                        print(f"DEBUG: {provider} still not configured")
+                        dialog.destroy()
+                        return None
 
-                elif response == Gtk.ResponseType.APPLY:
-                    print("DEBUG: Configure Now button clicked")
-                    # Show settings dialog when "Configure Now" is clicked
-                    self._show_settings_dialog(dialog)
-                    # Check if credentials were configured
-                    provider = self._get_provider()
-                    if self._credentials_ready(provider):
-                        print(f"DEBUG: {provider} configured, enabled OK button")
-                        ok_button.set_sensitive(True)
-                        ok_button.set_label("Composite Layers")
-                        if api_warning_bar:
-                            api_warning_bar.hide()
-                    else:
-                        print(f"DEBUG: {provider} still not configured")
+            # Lets the caller hand the dialog back to the user after a failed
+            # attempt, keeping the prompt and options they entered
+            def retry_dialog():
+                ok_button.set_sensitive(True)
+                ok_button.set_label("Composite Layers")
+                text_view.grab_focus()
+                return wait_for_prompt()
 
-                else:
-                    dialog.destroy()
-                    return None
+            self._retry_dialog = retry_dialog
+
+            return wait_for_prompt()
 
         except Exception as e:
             print(f"DEBUG: Composite dialog error: {e}")
@@ -1070,11 +1864,13 @@ class GimpAIPlugin(Gimp.PlugIn):
     def _show_settings_dialog(self, parent_dialog):
         """Show settings dialog with write-only API key field"""
         try:
+            self._init_gimp_ui()
             dialog = Gtk.Dialog(
                 title="AI Plugin Settings",
                 parent=parent_dialog,
                 flags=Gtk.DialogFlags.MODAL,
             )
+            dialog.get_style_context().add_class("ai-dialog")
 
             # Two columns keep the dialog short enough that the buttons stay on
             # screen at 1080p; the scrolled window covers smaller displays.
@@ -1086,6 +1882,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             save_button = dialog.add_button("Save", Gtk.ResponseType.OK)
             save_button.set_can_default(True)
             save_button.grab_default()
+            save_button.get_style_context().add_class("suggested-action")
 
             # Add content
             dialog_content = dialog.get_content_area()
@@ -1094,29 +1891,31 @@ class GimpAIPlugin(Gimp.PlugIn):
             scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
             dialog_content.pack_start(scroller, True, True, 0)
 
-            columns = Gtk.HBox(spacing=15)
+            columns = Gtk.HBox(spacing=24)
             columns.set_margin_start(20)
             columns.set_margin_end(20)
             columns.set_margin_top(20)
             columns.set_margin_bottom(20)
             scroller.add(columns)
 
-            content_area = Gtk.VBox(spacing=15)
-            right_column = Gtk.VBox(spacing=15)
+            content_area = Gtk.VBox(spacing=10)
+            right_column = Gtk.VBox(spacing=10)
             columns.pack_start(content_area, True, True, 0)
+            columns.pack_start(
+                Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0
+            )
             columns.pack_start(right_column, True, True, 0)
 
             # Provider selection
-            provider_frame = Gtk.Frame(label="Inpainting Provider")
-            provider_box = Gtk.VBox(spacing=10)
-            provider_box.set_margin_start(10)
-            provider_box.set_margin_end(10)
-            provider_box.set_margin_top(10)
-            provider_box.set_margin_bottom(10)
+            provider_box = self._add_section(
+                content_area, "Inpainting Provider",
+                "Service used for inpainting, erase and upscale.",
+                icon="provider", separator=False,
+            )
 
             provider_combo = Gtk.ComboBoxText()
             provider_ids = ["openai", "bedrock"]
-            provider_combo.append_text("OpenAI (GPT-Image-1)")
+            provider_combo.append_text("OpenAI (GPT-Image)")
             provider_combo.append_text("Amazon Bedrock (Stability inpainting)")
             current_provider = self.config.get("api_provider", "openai")
             provider_combo.set_active(
@@ -1138,16 +1937,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 provider_combo.set_sensitive(False)
                 provider_info.set_text("bedrock_client.py is missing - reinstall the plugin")
 
-            provider_frame.add(provider_box)
-            content_area.pack_start(provider_frame, False, False, 0)
-
             # API Key section
-            api_frame = Gtk.Frame(label="OpenAI API Configuration")
-            api_box = Gtk.VBox(spacing=10)
-            api_box.set_margin_start(10)
-            api_box.set_margin_end(10)
-            api_box.set_margin_top(10)
-            api_box.set_margin_bottom(10)
+            api_box = self._add_section(
+                content_area, "OpenAI", "API key and image model.", icon="openai"
+            )
 
             # Current API key status
             current_key = self.config.get("openai", {}).get("api_key")
@@ -1169,17 +1962,30 @@ class GimpAIPlugin(Gimp.PlugIn):
             key_entry.set_visibility(False)  # Hide the text for security
             api_box.pack_start(key_entry, False, False, 0)
 
-            api_frame.add(api_box)
-            content_area.pack_start(api_frame, False, False, 0)
+            # Image model
+            openai_model_label = Gtk.Label(label="Image model:")
+            openai_model_label.set_halign(Gtk.Align.START)
+            api_box.pack_start(openai_model_label, False, False, 0)
+
+            openai_model_ids = [model_id for model_id, _ in OPENAI_IMAGE_MODELS]
+            openai_model_combo = Gtk.ComboBoxText()
+            for _, label in OPENAI_IMAGE_MODELS:
+                openai_model_combo.append_text(label)
+            current_model = self._get_openai_model()
+            if current_model not in openai_model_ids:
+                # Keep a hand-edited model id selectable instead of losing it
+                openai_model_ids.append(current_model)
+                openai_model_combo.append_text(current_model)
+            openai_model_combo.set_active(openai_model_ids.index(current_model))
+            api_box.pack_start(openai_model_combo, False, False, 0)
 
             # Bedrock section
             bedrock_config = self.config.get("bedrock", {})
-            bedrock_frame = Gtk.Frame(label="Amazon Bedrock Configuration")
-            bedrock_box = Gtk.VBox(spacing=10)
-            bedrock_box.set_margin_start(10)
-            bedrock_box.set_margin_end(10)
-            bedrock_box.set_margin_top(10)
-            bedrock_box.set_margin_bottom(10)
+            bedrock_box = self._add_section(
+                right_column, "Amazon Bedrock",
+                "Region, model and AWS credentials.",
+                icon="bedrock", separator=False,
+            )
 
             # A grid keeps each setting on one row instead of two
             bedrock_grid = Gtk.Grid()
@@ -1255,16 +2061,10 @@ class GimpAIPlugin(Gimp.PlugIn):
             bedrock_info.get_style_context().add_class("dim-label")
             bedrock_box.pack_start(bedrock_info, False, False, 0)
 
-            bedrock_frame.add(bedrock_box)
-            right_column.pack_start(bedrock_frame, False, False, 0)
-
             # Prompt History section
-            history_frame = Gtk.Frame(label="Prompt History")
-            history_box = Gtk.VBox(spacing=10)
-            history_box.set_margin_start(10)
-            history_box.set_margin_end(10)
-            history_box.set_margin_top(10)
-            history_box.set_margin_bottom(10)
+            history_box = self._add_section(
+                content_area, "Prompt History", icon="history"
+            )
 
             # History count
             history_count = len(self._get_prompt_history())
@@ -1277,16 +2077,8 @@ class GimpAIPlugin(Gimp.PlugIn):
             clear_button.connect("clicked", self._on_clear_history_clicked)
             history_box.pack_start(clear_button, False, False, 0)
 
-            history_frame.add(history_box)
-            content_area.pack_start(history_frame, False, False, 0)
-
             # Debug Settings section
-            debug_frame = Gtk.Frame(label="Debug Settings")
-            debug_box = Gtk.VBox(spacing=10)
-            debug_box.set_margin_start(10)
-            debug_box.set_margin_end(10)
-            debug_box.set_margin_top(10)
-            debug_box.set_margin_bottom(10)
+            debug_box = self._add_section(content_area, "Debug", icon="debug")
 
             # Debug mode checkbox
             debug_checkbox = Gtk.CheckButton()
@@ -1304,9 +2096,6 @@ class GimpAIPlugin(Gimp.PlugIn):
             debug_info.get_style_context().add_class("dim-label")
             debug_box.pack_start(debug_info, False, False, 0)
 
-            debug_frame.add(debug_box)
-            content_area.pack_start(debug_frame, False, False, 0)
-
             # Show all widgets - must start from the dialog's own content area,
             # since content_area is only the left column here
             dialog_content.show_all()
@@ -1321,6 +2110,14 @@ class GimpAIPlugin(Gimp.PlugIn):
                         self.config["openai"] = {}
                     self.config["openai"]["api_key"] = new_key
                     print("DEBUG: API key updated")
+
+                # Save OpenAI image model
+                active_model = openai_model_combo.get_active()
+                if active_model >= 0:
+                    self.config.setdefault("openai", {})["model"] = openai_model_ids[
+                        active_model
+                    ]
+                    print(f"DEBUG: OpenAI model set to {openai_model_ids[active_model]}")
 
                 # Save provider selection
                 active = provider_combo.get_active()
@@ -1554,8 +2351,14 @@ class GimpAIPlugin(Gimp.PlugIn):
             return False, f"Context extraction error: {str(e)}", None
 
 
-    def _calculate_full_image_context_extraction(self, image):
-        """Calculate context extraction for full image (GPT-Image-1 mode)"""
+    def _calculate_full_image_context_extraction(self, image, any_size=False):
+        """
+        Calculate context extraction for the full image.
+
+        any_size: the provider takes arbitrary sizes (GPT-Image-2.x), so the
+        image keeps its own aspect ratio and is only scaled down to the size
+        limit instead of being squeezed into one of three fixed shapes.
+        """
         try:
             print("DEBUG: Calculating full image context extraction")
 
@@ -1572,8 +2375,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 f"DEBUG: Full image bounds: ({full_x1},{full_y1}) to ({full_x2},{full_y2})"
             )
 
-            # For full image mode, select optimal OpenAI shape
-            target_shape = get_optimal_openai_shape(orig_width, orig_height)
+            if any_size:
+                target_shape = get_gpt_image_shape(orig_width, orig_height)
+            else:
+                target_shape = get_optimal_openai_shape(orig_width, orig_height)
             target_width, target_height = target_shape
             target_size = max(target_width, target_height)  # For backward compatibility
 
@@ -1902,20 +2707,19 @@ class GimpAIPlugin(Gimp.PlugIn):
             current_time = time.time()
             elapsed = current_time - start_time
 
-            # Update progress every 5 seconds
-            if progress_label and current_time - last_update_time > 5:
-                print(f"DEBUG: About to call _update_progress at {elapsed:.1f}s")
-                minutes = int(elapsed // 60)
+            # Update progress every second
+            if progress_label and current_time - last_update_time >= 1:
+                minutes, seconds = divmod(int(elapsed), 60)
                 if minutes > 0:
                     self._update_progress(
-                        progress_label, f"Still processing... ({minutes}m elapsed)"
+                        progress_label,
+                        f"Still processing... ({minutes}m {seconds:02d}s elapsed)",
                     )
                 else:
                     self._update_progress(
-                        progress_label, f"Processing... ({int(elapsed)}s elapsed)"
+                        progress_label, f"Processing... ({seconds}s elapsed)"
                     )
                 last_update_time = current_time
-                print(f"DEBUG: _update_progress call completed")
 
             # Check for cancellation
             if self._check_cancel_and_process_events():
@@ -1948,6 +2752,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             ok_button = dialog.add_button("Upscale", Gtk.ResponseType.OK)
             ok_button.set_can_default(True)
             ok_button.grab_default()
+            ok_button.get_style_context().add_class("suggested-action")
 
             content_area = self._setup_dialog_content_area(dialog, spacing=10)
 
@@ -1958,9 +2763,11 @@ class GimpAIPlugin(Gimp.PlugIn):
                 ok_button.set_sensitive(False)
                 ok_button.set_label("Configure & Continue")
 
-            label = Gtk.Label(label="Upscale method:")
-            label.set_halign(Gtk.Align.START)
-            content_area.pack_start(label, False, False, 0)
+            method_box = self._add_section(
+                content_area, "1. Method",
+                "Upscales the active layer, not the whole image.",
+                icon="upscale", separator=False,
+            )
 
             variants = ["fast", "conservative", "creative"]
             combo = Gtk.ComboBoxText()
@@ -1969,69 +2776,106 @@ class GimpAIPlugin(Gimp.PlugIn):
             combo.append_text("Creative - to ~4K, invents detail, slowest")
             last = self.config.get("bedrock", {}).get("upscale_variant", "conservative")
             combo.set_active(variants.index(last) if last in variants else 1)
-            content_area.pack_start(combo, False, False, 0)
-
-            prompt_label = Gtk.Label(
-                label="Describe the image (used by Conservative and Creative):"
-            )
-            prompt_label.set_halign(Gtk.Align.START)
-            content_area.pack_start(prompt_label, False, False, 0)
-
-            prompt_entry = Gtk.Entry()
-            prompt_entry.set_placeholder_text(bedrock_client.DEFAULT_UPSCALE_PROMPT)
-            prompt_entry.set_text(self.config.get("last_upscale_prompt", ""))
-            content_area.pack_start(prompt_entry, False, False, 0)
+            method_box.pack_start(combo, False, False, 0)
 
             info = Gtk.Label()
             info.set_text(
-                "Upscales the active layer, not the whole image. Fast only accepts "
-                "layers up to 1536px per side; larger layers are reduced to fit "
-                "before upscaling."
+                "Fast only accepts layers up to 1536px per side; larger layers "
+                "are reduced to fit before upscaling."
             )
             info.set_line_wrap(True)
             info.set_max_width_chars(56)
             info.set_xalign(0.0)
             info.get_style_context().add_class("dim-label")
-            content_area.pack_start(info, False, False, 0)
+            method_box.pack_start(info, False, False, 0)
+
+            prompt_box = self._add_section(
+                content_area, "2. Prompt",
+                "Describe the image (used by Conservative and Creative).",
+                icon="prompt",
+            )
+
+            prompt_entry = Gtk.Entry()
+            prompt_entry.set_placeholder_text(bedrock_client.DEFAULT_UPSCALE_PROMPT)
+            prompt_entry.set_text(self.config.get("last_upscale_prompt", ""))
+            prompt_box.pack_start(prompt_entry, False, False, 0)
+
+            status_box = self._add_section(content_area, "Status", icon="status")
+            refresh_model_info = self._add_model_info_box(
+                status_box, "upscale", variants[max(0, combo.get_active())]
+            )
+            combo.connect(
+                "changed",
+                lambda c: refresh_model_info(variants[max(0, c.get_active())]),
+            )
 
             progress_frame, progress_label = self._create_progress_widget()
-            content_area.pack_start(progress_frame, False, False, 0)
+            status_box.pack_start(progress_frame, False, False, 0)
 
             content_area.show_all()
 
-            while True:
-                response = dialog.run()
-                if response == Gtk.ResponseType.OK:
-                    provider = self._get_provider()
-                    if not self._credentials_ready(provider):
-                        self._show_settings_dialog(dialog)
+            # Keeps the dialog responsive to Cancel while the request runs
+            def on_dialog_response(dialog, response_id):
+                if response_id == Gtk.ResponseType.CANCEL:
+                    print("DEBUG: Cancel button clicked during processing")
+                    self._cancel_requested = True
+                return False
+
+            dialog.connect("response", on_dialog_response)
+
+            def wait_for_options():
+                while True:
+                    response = dialog.run()
+                    if response == Gtk.ResponseType.OK:
                         provider = self._get_provider()
                         if not self._credentials_ready(provider):
+                            self._show_settings_dialog(dialog)
+                            provider = self._get_provider()
+                            refresh_model_info()
+                            if not self._credentials_ready(provider):
+                                continue
+                            if api_warning_bar:
+                                api_warning_bar.hide()
+                            ok_button.set_sensitive(True)
+                            ok_button.set_label("Upscale")
                             continue
-                        if api_warning_bar:
-                            api_warning_bar.hide()
-                        ok_button.set_sensitive(True)
-                        ok_button.set_label("Upscale")
+
+                        variant = variants[max(0, combo.get_active())]
+                        prompt = prompt_entry.get_text().strip()
+                        self.config.setdefault("bedrock", {})["upscale_variant"] = variant
+                        self.config["last_upscale_prompt"] = prompt
+                        self._save_config()
+
+                        # Disable OK button to prevent multiple clicks
+                        ok_button.set_sensitive(False)
+                        ok_button.set_label("Processing...")
+                        self._flush_ui()
+                        self._cancel_requested = False
+                        return dialog, progress_label, variant, prompt
+
+                    if response in (Gtk.ResponseType.APPLY, Gtk.ResponseType.HELP):
+                        self._show_settings_dialog(dialog)
+                        refresh_model_info()
+                        if self._credentials_ready(self._get_provider()):
+                            if api_warning_bar:
+                                api_warning_bar.hide()
+                            ok_button.set_sensitive(True)
+                            ok_button.set_label("Upscale")
                         continue
 
-                    variant = variants[max(0, combo.get_active())]
-                    prompt = prompt_entry.get_text().strip()
-                    self.config.setdefault("bedrock", {})["upscale_variant"] = variant
-                    self.config["last_upscale_prompt"] = prompt
-                    self._save_config()
-                    return dialog, progress_label, variant, prompt
+                    dialog.destroy()
+                    return None
 
-                if response in (Gtk.ResponseType.APPLY, Gtk.ResponseType.HELP):
-                    self._show_settings_dialog(dialog)
-                    if self._credentials_ready(self._get_provider()):
-                        if api_warning_bar:
-                            api_warning_bar.hide()
-                        ok_button.set_sensitive(True)
-                        ok_button.set_label("Upscale")
-                    continue
+            # Lets the caller hand the dialog back to the user after a failed
+            # attempt, keeping the options they chose
+            def retry_dialog():
+                ok_button.set_sensitive(True)
+                ok_button.set_label("Upscale")
+                return wait_for_options()
 
-                dialog.destroy()
-                return None
+            self._retry_dialog = retry_dialog
+
+            return wait_for_options()
 
         except Exception as e:
             print(f"DEBUG: Upscale dialog error: {e}")
@@ -2185,12 +3029,13 @@ class GimpAIPlugin(Gimp.PlugIn):
     def _call_openai_generation(
         self, prompt, api_key, size="auto", progress_label=None
     ):
-        """Call OpenAI GPT-Image-1 API for image generation with progress updates"""
+        """Call OpenAI GPT-Image API for image generation with progress updates"""
         try:
             import json
             import urllib.request
 
-            print(f"DEBUG: Calling GPT-Image-1 generation API with prompt: {prompt}")
+            model = self._get_openai_model()
+            print(f"DEBUG: Calling {model} generation API with prompt: {prompt}")
 
             # Determine optimal size
             if size == "auto":
@@ -2202,7 +3047,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Prepare the request data
             data = {
-                "model": "gpt-image-1",
+                "model": model,
                 "prompt": prompt,
                 "n": 1,
                 "size": optimal_size,
@@ -2216,16 +3061,16 @@ class GimpAIPlugin(Gimp.PlugIn):
             req.add_header("Content-Type", "application/json")
             req.add_header("Authorization", f"Bearer {api_key}")
 
-            print("DEBUG: Sending real GPT-Image-1 generation request...")
+            print(f"DEBUG: Sending real {model} generation request...")
 
             # Progress during network operation (same pattern as _call_openai_edit)
             if progress_label:
                 self._update_progress(
-                    progress_label, "🚀 Sending request to GPT-Image-1..."
+                    progress_label, f"🚀 Sending request to {model}..."
                 )
 
             # Make the API call with progress updates during the call
-            with self._make_url_request(req, timeout=180) as response:
+            with self._make_url_request(req, timeout=OPENAI_TIMEOUT) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
 
             print("DEBUG: GPT-Image-1 generation response received")
@@ -2238,7 +3083,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 result_data = response_data["data"][0]
 
                 if "b64_json" in result_data:
-                    print("DEBUG: Processing base64 image data from GPT-Image-1")
+                    print(f"DEBUG: Processing base64 image data from {model}")
                     import base64
 
                     image_data = base64.b64decode(result_data["b64_json"])
@@ -2246,30 +3091,65 @@ class GimpAIPlugin(Gimp.PlugIn):
 
                     return True, "Image generation successful", image_data
                 else:
-                    print("ERROR: No b64_json in GPT-Image-1 response")
+                    print(f"ERROR: No b64_json in {model} response")
                     return False, "No image data in response", None
             else:
-                print("ERROR: No data in GPT-Image-1 response")
+                print(f"ERROR: No data in {model} response")
                 return False, "No data in API response", None
 
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
+            print(f"ERROR: OpenAI generation HTTP error: {e.code} - {error_body}")
+            return False, f"OpenAI image API error {e.code}: {error_body[:200]}", None
         except Exception as e:
-            print(f"ERROR: GPT-Image-1 generation API call failed: {str(e)}")
+            print(f"ERROR: OpenAI generation API call failed: {str(e)}")
             return False, str(e), None
 
-    def _call_generation_threaded(
-        self, prompt, api_key, width, height, progress_label=None
+    def _call_openai_reference_generation(
+        self, prompt, api_key, references, size, progress_label=None
     ):
-        """Threaded wrapper dispatching generation to the configured provider"""
+        """
+        Generate from a prompt plus reference images (PNG bytes). Text-only
+        generation has no image input, so this goes through the edits endpoint
+        without a mask. Returns raw image bytes like _call_openai_generation.
+        """
+        success, message, response = self._call_openai_edit(
+            list(references), None, prompt, api_key, size, progress_label
+        )
+        if not success:
+            return False, message, None
+        try:
+            image_data = base64.b64decode(response["data"][0]["b64_json"])
+        except (KeyError, IndexError, TypeError):
+            return False, "No image data in response", None
+        return True, "Image generation successful", image_data
+
+    def _call_generation_threaded(
+        self, prompt, api_key, width, height, progress_label=None, exact_size=False,
+        references=None,
+    ):
+        """
+        Threaded wrapper dispatching generation to the configured provider.
+
+        exact_size: width x height was picked by the user for a new image,
+        rather than taken from an existing canvas.
+        references: reference images as PNG bytes (OpenAI only).
+        """
         provider = self._get_provider()
+        openai_size = self._openai_generation_size(width, height, exact_size)
 
         def operation():
             if provider == "bedrock":
                 success, message, data = self._call_bedrock_generation(
                     prompt, width, height, progress_label
                 )
+            elif references:
+                success, message, data = self._call_openai_reference_generation(
+                    prompt, api_key, references, openai_size, progress_label
+                )
             else:
                 success, message, data = self._call_openai_generation(
-                    prompt, api_key, "auto", progress_label
+                    prompt, api_key, openai_size, progress_label
                 )
             return {"success": success, "message": message, "data": data}
 
@@ -3313,12 +4193,10 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             if is_array_mode:
                 print(f"DEBUG: Array mode: {len(image_data)} images provided")
-                if len(image_data) < 2:
-                    return (
-                        False,
-                        "Error: At least 2 images required for composite mode",
-                        None,
-                    )
+                # A single listed image is generation from references, with
+                # no mask; layer composite checks its own minimum of two
+                if len(image_data) < 1:
+                    return False, "Error: No images provided", None
                 if len(image_data) > 16:
                     return False, "Error: Maximum 16 layers supported", None
             else:
@@ -3329,6 +4207,15 @@ class GimpAIPlugin(Gimp.PlugIn):
                         "Error: No mask data provided for single image mode",
                         None,
                     )
+
+            # The edits endpoint rejects masks of 4 MB or more
+            if mask_data and len(mask_data) >= 4 * 1024 * 1024:
+                return (
+                    False,
+                    f"Error: Mask is {len(mask_data) / (1024 * 1024):.1f} MB, "
+                    "over the 4 MB OpenAI accepts",
+                    None,
+                )
 
             if not api_key or api_key == "test-api-key":
                 print("DEBUG: No valid API key provided, returning mock response")
@@ -3344,16 +4231,20 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             url = "https://api.openai.com/v1/images/edits"
 
-            # Prepare multipart form data for GPT-Image-1
+            # Prepare multipart form data
+            model = self._get_openai_model()
             fields = {
-                "model": "gpt-image-1",
+                "model": model,
                 "prompt": prompt,
                 "n": "1",
                 "quality": "high",
                 "size": size if size else "1024x1024",  # Use provided size or default
                 "moderation": "low",  # Less restrictive filtering
-                "input_fidelity": "high",  # High fidelity for better results
             }
+            # Only gpt-image-1 takes input_fidelity; the 2.x models always use
+            # high fidelity and may reject the parameter
+            if model == "gpt-image-1":
+                fields["input_fidelity"] = "high"
 
             # Prepare files for API based on mode
             import base64
@@ -3590,7 +4481,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-            print("DEBUG: Sending real GPT-Image-1 API request...")
+            print(f"DEBUG: Sending real {model} API request...")
 
             # Progress during network operation
             print("DEBUG: Setting progress text to 'Sending request to GPT-Image-1...'")
@@ -3602,7 +4493,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             #     Gimp.progress_update(0.65)  # 65% - API request started (after 60% mask)
             #     Gimp.displays_flush()  # Force UI update before blocking network call
 
-            with self._make_url_request(req, timeout=120) as response:
+            with self._make_url_request(req, timeout=OPENAI_TIMEOUT) as response:
                 # More progress during data reading
                 if progress_label:
                     self._update_progress(
@@ -3622,24 +4513,25 @@ class GimpAIPlugin(Gimp.PlugIn):
 
                 response_json = json.loads(response_data)
                 print(
-                    f"DEBUG: GPT-Image-1 API response received: {len(response_data)} bytes"
+                    f"DEBUG: {model} API response received: {len(response_data)} bytes"
                 )
-                return True, "GPT-Image-1 API call successful", response_json
+                return True, f"{model} API call successful", response_json
 
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
-            print(f"DEBUG: GPT-Image-1 API HTTP error: {e.code} - {error_body}")
-            return False, f"GPT-Image-1 API error {e.code}: {error_body[:200]}", None
+            print(f"DEBUG: OpenAI image API HTTP error: {e.code} - {error_body}")
+            return False, f"OpenAI image API error {e.code}: {error_body[:200]}", None
         except Exception as e:
-            print(f"DEBUG: GPT-Image-1 API call failed: {e}")
-            return False, f"GPT-Image-1 API call failed: {str(e)}", None
+            print(f"DEBUG: OpenAI image API call failed: {e}")
+            return False, f"OpenAI image API call failed: {str(e)}", None
 
-    def _convert_mask_to_bedrock(self, mask_data):
+    def _convert_mask_to_luminance(self, mask_data):
         """
-        Convert an OpenAI-convention mask to the Bedrock/Stability convention.
+        Convert an OpenAI-convention mask to a white-on-black luminance mask.
 
         OpenAI marks the area to inpaint with transparency; Stability marks it
-        with white pixels (black = preserve). Flattening the mask onto a white
+        with white pixels (black = preserve), and the OpenAI mask hint shows the
+        model the same white-on-black picture. Flattening the mask onto a white
         background converts one to the other, and keeps the feathered edges as
         greyscale values, which Stability reads as partial inpaint strength.
 
@@ -3671,16 +4563,16 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             if self._is_debug_mode():
                 debug_path = os.path.join(
-                    tempfile.gettempdir(), f"bedrock_mask_{len(converted)}_bytes.png"
+                    tempfile.gettempdir(), f"luminance_mask_{len(converted)}_bytes.png"
                 )
                 try:
                     with open(debug_path, "wb") as debug_file:
                         debug_file.write(converted)
-                    print(f"DEBUG: Saved Bedrock mask to {debug_path}")
+                    print(f"DEBUG: Saved luminance mask to {debug_path}")
                 except Exception as e:
                     print(f"DEBUG: Could not save debug file: {e}")
 
-            print(f"DEBUG: Converted mask to Bedrock convention: {len(converted)} bytes")
+            print(f"DEBUG: Converted mask to luminance convention: {len(converted)} bytes")
             return converted
 
         finally:
@@ -3812,6 +4704,44 @@ class GimpAIPlugin(Gimp.PlugIn):
             "target_size": max(native["target_shape"]),
             "needs_padding": False,
             "padding_info": native["padding_info"],
+            "has_selection": True,
+        }
+
+    def _calculate_gpt_image_context_extraction(self, image):
+        """
+        Context window for GPT-Image-2.x at native resolution.
+
+        Same window as Bedrock's native path - a small selection gets a large
+        window of real pixels instead of a tight crop blown up to a fixed
+        shape - then fitted to the 2.x size rules (multiples of 16, area
+        limits). Only rounding leaves a few pixels of padding.
+        """
+        from coordinate_utils import calculate_native_context
+
+        bounds = Gimp.Selection.bounds(image)
+        sel_x1, sel_y1, sel_x2, sel_y2 = bounds[2], bounds[3], bounds[4], bounds[5]
+
+        native = calculate_native_context(
+            image.get_width(), image.get_height(), (sel_x1, sel_y1, sel_x2, sel_y2)
+        )
+        x, y, width, height = native["extract_region"]
+        target_shape = get_gpt_image_shape(width, height)
+        padding_info = calculate_padding_for_shape(width, height, *target_shape)
+        print(
+            f"DEBUG: GPT-Image context window ({x},{y}) {width}x{height} -> "
+            f"{target_shape[0]}x{target_shape[1]}, "
+            f"scale {padding_info['scale_factor']:.3f} "
+            f"(selection {sel_x2 - sel_x1}x{sel_y2 - sel_y1})"
+        )
+
+        return {
+            "mode": "focused",
+            "selection_bounds": (sel_x1, sel_y1, sel_x2, sel_y2),
+            "extract_region": native["extract_region"],
+            "target_shape": target_shape,
+            "target_size": max(target_shape),
+            "needs_padding": any(padding_info["padding"]),
+            "padding_info": padding_info,
             "has_selection": True,
         }
 
@@ -3991,7 +4921,8 @@ class GimpAIPlugin(Gimp.PlugIn):
         )
 
     def _download_and_composite_result(
-        self, image, api_response, context_info, mode, color_info=None
+        self, image, api_response, context_info, mode, color_info=None,
+        clip_to_selection=True,
     ):
         """Download AI result and composite it back to original image with proper masking"""
         try:
@@ -4216,8 +5147,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                     print("DEBUG: Applying color matching to result layer...")
                     self._apply_color_matching(result_layer, color_info)
 
-                # Create a layer mask for contextual mode only
-                if mode == "contextual" and context_info["has_selection"]:
+                # Restrict the result layer to the selection in contextual and full-image modes
+                if mode in ("contextual", "full_image") and context_info["has_selection"]:
                     print(
                         "DEBUG: Creating selection-based mask for contextual mode while preserving full AI result in layer"
                     )
@@ -4230,6 +5161,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                     # Apply smart feathering to the mask for better blending
                     self._apply_smart_mask_feathering(mask, image)
 
+                    # Unclipped: keep the mask but leave it off, so the clip is
+                    # one click away (Layers > Disable Layer Mask) and the mask
+                    # can be painted to allow only some of the overflow
+                    if not clip_to_selection:
+                        result_layer.set_apply_mask(False)
+                        print("DEBUG: Clip to selection off - layer mask kept but disabled")
+
                     print(
                         "DEBUG: Applied selection-based layer mask with smart feathering - enhanced blending at edges"
                     )
@@ -4238,7 +5176,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                     )
                 else:
                     print(
-                        "DEBUG: No selection or full_image mode - layer shows full AI result without mask"
+                        "DEBUG: No active selection - layer shows full AI result without mask"
                     )
 
                 # VALIDATION CHECKS
@@ -4289,7 +5227,9 @@ class GimpAIPlugin(Gimp.PlugIn):
             "gimp-ai-erase-object",
             "gimp-ai-upscale",
             "gimp-ai-layer-generator",
+            "gimp-ai-image-generator",
             "gimp-ai-layer-composite",
+            "gimp-ai-settings",
         ]
 
     def do_create_procedure(self, name):
@@ -4321,8 +5261,25 @@ class GimpAIPlugin(Gimp.PlugIn):
             procedure = Gimp.ImageProcedure.new(
                 self, name, Gimp.PDBProcType.PLUGIN, self.run_layer_generator, None
             )
-            procedure.set_menu_label("Image Generator")
+            procedure.set_menu_label("Generate Layer")
             procedure.add_menu_path("<Image>/Filters/AI/")
+            # Needs an open image, but not a selected drawable
+            procedure.set_sensitivity_mask(
+                Gimp.ProcedureSensitivityMask.DRAWABLE
+                | Gimp.ProcedureSensitivityMask.DRAWABLES
+                | Gimp.ProcedureSensitivityMask.NO_DRAWABLES
+            )
+            return procedure
+
+        elif name == "gimp-ai-image-generator":
+            procedure = Gimp.ImageProcedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self.run_image_generator, None
+            )
+            procedure.set_menu_label("Generate New Image")
+            procedure.add_menu_path("<Image>/Filters/AI/")
+            procedure.add_menu_path("<Image>/File/Create/")
+            # Ignores any open image, so it is available with or without one
+            procedure.set_sensitivity_mask(Gimp.ProcedureSensitivityMask.ALWAYS)
             return procedure
 
         elif name == "gimp-ai-layer-composite":
@@ -4331,6 +5288,16 @@ class GimpAIPlugin(Gimp.PlugIn):
             )
             procedure.set_menu_label("Layer Composite")
             procedure.add_menu_path("<Image>/Filters/AI/")
+            return procedure
+
+        elif name == "gimp-ai-settings":
+            procedure = Gimp.ImageProcedure.new(
+                self, name, Gimp.PDBProcType.PLUGIN, self.run_settings, None
+            )
+            procedure.set_menu_label("Settings...")
+            procedure.add_menu_path("<Image>/Filters/AI/")
+            # Settings do not touch the image, so allow them with none open
+            procedure.set_sensitivity_mask(Gimp.ProcedureSensitivityMask.ALWAYS)
             return procedure
 
         return None
@@ -4370,29 +5337,22 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
         dialog, progress_label, variant, prompt = dialog_result
 
-        try:
+        def attempt():
+            """One try at the upscale; returns (headline, details) on failure"""
             self._log_bedrock_environment()
             try:
                 bedrock_client.upscale_credentials(
                     self.config.get("bedrock", {}), variant
                 )
             except bedrock_client.BedrockError as e:
-                self._update_progress(progress_label, "❌ No AWS credentials found!")
-                Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Amazon Bedrock is not configured", str(e)
 
             self._update_progress(progress_label, "🔍 Preparing layer...")
             image_data, original_size, sent_size = self._export_layer_for_upscale(
                 source_layer, variant
             )
             if not image_data:
-                self._update_progress(progress_label, "❌ Could not export the layer")
-                Gimp.message("❌ Could not export the active layer")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Could not export the active layer", ""
 
             note = ""
             if sent_size != original_size:
@@ -4409,15 +5369,11 @@ class GimpAIPlugin(Gimp.PlugIn):
                 variant, image_data, prompt, progress_label
             )
             if not ok:
-                if "cancelled" in message.lower():
-                    self._update_progress(progress_label, "❌ Cancelled")
-                    Gimp.message("❌ Operation cancelled by user")
-                else:
-                    self._update_progress(progress_label, f"❌ {message}")
-                    Gimp.message(f"❌ Upscale Failed: {message}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
-                )
+                if "cancelled" not in message.lower():
+                    return "Upscale failed", message
+                self._update_progress(progress_label, "❌ Cancelled")
+                Gimp.message("❌ Operation cancelled by user")
+                return None
 
             self._update_progress(progress_label, "Placing result...")
             suffix = "." + bedrock_client.UPSCALE_VARIANTS[variant]["output_format"]
@@ -4426,11 +5382,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 offsets=source_layer.get_offsets()[1:],
             )
             if not new_layer:
-                self._update_progress(progress_label, "❌ Could not load the result")
-                Gimp.message("❌ Upscale returned an image GIMP could not load")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
-                )
+                return "Upscale returned an image GIMP could not load", ""
 
             factor = new_layer.get_width() / max(1, original_size[0])
             self._update_progress(
@@ -4445,7 +5397,32 @@ class GimpAIPlugin(Gimp.PlugIn):
                 "Image → Fit Canvas to Layers to see all of it."
             )
             Gimp.displays_flush()
-            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+            return None
+
+        try:
+            # On failure the dialog stays open with the error shown, so the
+            # user can pick another method or prompt and try again
+            while True:
+                try:
+                    failure = attempt()
+                except Exception as e:
+                    print(f"ERROR: Upscale failed: {e}")
+                    failure = ("Upscale failed", str(e))
+                if not failure:
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                    )
+
+                # API calls can clear the layer selection
+                image.set_selected_layers(original_selected_layers)
+                dialog_result = self._offer_retry(progress_label, *failure)
+                if not dialog_result:
+                    # Closed or cancelled; the dialog has already destroyed itself
+                    dialog = None
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+                dialog, progress_label, variant, prompt = dialog_result
 
         finally:
             if dialog:
@@ -4494,14 +5471,49 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
 
         self._init_gimp_ui()
-        dialog = self._create_dialog_base("AI Erase Object", size=(420, 140))
+        dialog = self._create_dialog_base("AI Erase Object", size=(460, 140))
         content_area = self._setup_dialog_content_area(dialog)
+        status_box = self._add_section(
+            content_area, "Erasing Object",
+            "Removing the selected object and filling in the background.",
+            icon="erase", separator=False,
+        )
+        self._add_model_info_box(status_box, "erase")
         progress_frame, progress_label = self._create_progress_widget()
-        content_area.pack_start(progress_frame, False, False, 0)
+        status_box.pack_start(progress_frame, False, False, 0)
+
+        # Only shown after a failed attempt; there is nothing to adjust here,
+        # but transient errors such as throttling are worth another try
+        close_button = dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        retry_button = dialog.add_button("Try Again", Gtk.ResponseType.OK)
+        retry_button.get_style_context().add_class("suggested-action")
+
         content_area.show_all()
         dialog.show_all()
+        close_button.hide()
+        retry_button.hide()
 
-        try:
+        def retry_dialog():
+            close_button.show()
+            retry_button.show()
+            retry_button.grab_focus()
+            response = dialog.run()
+            close_button.hide()
+            retry_button.hide()
+            if response != Gtk.ResponseType.OK:
+                dialog.destroy()
+                return None
+            return True
+
+        self._retry_dialog = retry_dialog
+
+        def attempt():
+            """One try at the erase; returns (headline, details) on failure"""
+            # The selection can change between attempts
+            selection_bounds = Gimp.Selection.bounds(image)
+            if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+                return "No selection", "Select the object you want gone."
+
             self._update_progress(progress_label, "🔍 Reading image...")
             context_info = self._calculate_native_context_extraction(image)
 
@@ -4509,14 +5521,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 image, context_info
             )
             if not success:
-                self._update_progress(progress_label, f"❌ {message}")
-                Gimp.message(f"❌ Context Extraction Failed: {message}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Context extraction failed", message
 
             self._update_progress(progress_label, "🎭 Creating mask...")
-            mask_data = self._convert_mask_to_bedrock(
+            mask_data = self._convert_mask_to_luminance(
                 self._create_context_mask(
                     image, context_info, context_info["target_size"]
                 )
@@ -4535,15 +5543,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             )
 
             if not api_success:
-                if "cancelled" in api_message.lower():
-                    self._update_progress(progress_label, "❌ Cancelled")
-                    Gimp.message("❌ Operation cancelled by user")
-                else:
-                    self._update_progress(progress_label, f"❌ {api_message}")
-                    Gimp.message(f"❌ Erase Failed: {api_message}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
-                )
+                if "cancelled" not in api_message.lower():
+                    return "Erase failed", api_message
+                self._update_progress(progress_label, "❌ Cancelled")
+                Gimp.message("❌ Operation cancelled by user")
+                return None
 
             self._update_progress(progress_label, "Placing results...")
             # Paste the whole context window rather than masking back to the
@@ -4563,10 +5567,34 @@ class GimpAIPlugin(Gimp.PlugIn):
                 )
                 print(f"DEBUG: Erase complete - {placed} variation(s) placed")
             else:
-                self._update_progress(progress_label, f"⚠️ {last_message}")
-                Gimp.message(f"⚠️ Erased but import failed: {last_message}")
+                return "Erased but import failed", last_message
 
-            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+            return None
+
+        try:
+            while True:
+                try:
+                    failure = attempt()
+                except Exception as e:
+                    print(f"ERROR: Erase failed: {e}")
+                    failure = ("Erase failed", str(e))
+                if not failure:
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                    )
+
+                # API calls can clear the layer selection
+                if original_selected_layers:
+                    image.set_selected_layers(original_selected_layers)
+                if not self._offer_retry(
+                    progress_label, *failure,
+                    "Press Try Again to retry, or Close.",
+                ):
+                    # Closed; the dialog has already destroyed itself
+                    dialog = None
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
 
         finally:
             if dialog:
@@ -4612,6 +5640,9 @@ class GimpAIPlugin(Gimp.PlugIn):
             show_mode_selection=True,
             image=image,
             provider=self._get_provider(),
+            # Bedrock's inpainting takes a single image
+            show_references=self._get_provider() == "openai",
+            operation="inpaint",
         )
         print(f"DEBUG: Dialog returned: {repr(dialog_result)}")
 
@@ -4627,8 +5658,15 @@ class GimpAIPlugin(Gimp.PlugIn):
         dialog, progress_label, prompt, selected_mode = dialog_result
         print(f"DEBUG: Extracted prompt: '{prompt}', mode: '{selected_mode}'")
 
-        try:
-            # Step 3: Get credentials for the configured provider
+        def attempt():
+            """One try at the inpaint; returns (headline, details) on failure"""
+            # The selection can change between attempts
+            selection_bounds = Gimp.Selection.bounds(image)
+            if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+                return "No selection", "Select the area you want to inpaint."
+
+            # Step 3: Get credentials for the configured provider; read on
+            # every attempt since Settings may have changed them
             provider = self._get_provider()
             print(f"DEBUG: Inpainting provider: {provider}")
             api_key = None
@@ -4637,20 +5675,14 @@ class GimpAIPlugin(Gimp.PlugIn):
                 try:
                     bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
                 except bedrock_client.BedrockError as e:
-                    self._update_progress(progress_label, "❌ No AWS credentials found!")
-                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
-                    )
+                    return "Amazon Bedrock is not configured", str(e)
             else:
                 api_key = self._get_api_key()
                 if not api_key:
-                    self._update_progress(progress_label, "❌ No OpenAI API key found!")
-                    Gimp.message(
-                        "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
-                    )
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    return (
+                        "No OpenAI API key found",
+                        "Set your API key in Settings, config.json or the "
+                        "OPENAI_API_KEY environment variable.",
                     )
 
             # Create progress callback for thread-to-UI communication
@@ -4662,14 +5694,21 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             self._update_progress(progress_label, "🔍 Processing image...")
 
+            any_size = provider == "openai" and self._openai_accepts_any_size()
+
             if mode == "full_image":
                 print("DEBUG: Calculating full-image context extraction...")
-                context_info = self._calculate_full_image_context_extraction(image)
+                context_info = self._calculate_full_image_context_extraction(
+                    image, any_size=any_size
+                )
             elif mode == "contextual" and provider == "bedrock":
                 # Native resolution, so the window round-trips without
                 # resampling and can be pasted back whole
                 print("DEBUG: Calculating native-resolution context extraction...")
                 context_info = self._calculate_native_context_extraction(image)
+            elif mode == "contextual" and any_size:
+                print("DEBUG: Calculating GPT-Image native context extraction...")
+                context_info = self._calculate_gpt_image_context_extraction(image)
             elif mode == "contextual":
                 print("DEBUG: Calculating contextual selection-based extraction...")
                 context_info = self._calculate_context_extraction(image)
@@ -4695,14 +5734,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                 image, context_info
             )
             if not success:
-                self._update_progress(
-                    progress_label, f"❌ Context extraction failed: {message}"
-                )
-                Gimp.message(f"❌ Context Extraction Failed: {message}")
                 print(f"DEBUG: Context extraction failed: {message}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Context extraction failed", message
             print(f"DEBUG: Context extraction succeeded: {message}")
 
             self._update_progress(progress_label, "🎭 Creating selection mask...")
@@ -4710,11 +5743,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             # Create smart mask that respects selection within context
             print("DEBUG: Creating context-aware mask...")
             if not context_info:
-                self._update_progress(progress_label, "❌ Context info not available")
-                Gimp.message("❌ Context info not available")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Context info not available", ""
 
             mask_data = self._create_context_mask(
                 image, context_info, context_info["target_size"]
@@ -4723,7 +5752,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             # Bedrock reads the mask from luminance, not alpha. Convert here, on
             # the main thread, before the API call is handed to a worker thread.
             if provider == "bedrock":
-                mask_data = self._convert_mask_to_bedrock(mask_data)
+                mask_data = self._convert_mask_to_luminance(mask_data)
 
             self._update_progress(progress_label, "🚀 Starting AI processing...")
 
@@ -4760,10 +5789,28 @@ class GimpAIPlugin(Gimp.PlugIn):
                     name="Bedrock inpaint API call",
                 )
             else:
+                # References follow the edited image; the mask applies to the
+                # first image only. Exported here, on the main thread.
+                api_image_data, api_prompt = image_data, prompt
+                reference_pngs = self._export_references(self._dialog_references)
+                if self._openai_mask_hint():
+                    print("DEBUG: Sending selection as mask hint image")
+                    hint_png = self._convert_mask_to_luminance(mask_data)
+                    api_image_data = [image_data, hint_png] + reference_pngs
+                    api_prompt = self._prompt_with_mask_hint(
+                        prompt, len(reference_pngs)
+                    )
+                elif reference_pngs:
+                    print(f"DEBUG: Sending {len(reference_pngs)} reference image(s)")
+                    api_image_data = [image_data] + reference_pngs
+                    api_prompt = self._prompt_with_reference_note(
+                        prompt, len(reference_pngs)
+                    )
+
                 api_success, api_message, api_response = self._call_edit_threaded(
-                    image_data,
+                    api_image_data,
                     mask_data,
-                    prompt,
+                    api_prompt,
                     api_key,
                     size=api_size,
                     progress_label=progress_label,
@@ -4780,6 +5827,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # reach the API, so it keeps the selection mask.
                 scale = context_info.get("padding_info", {}).get("scale_factor", 1.0)
                 whole_window = provider == "bedrock" and abs(scale - 1.0) < 0.005
+                clip_to_selection = self.config.get("clip_to_selection", True)
                 print(
                     f"DEBUG: Composite scale {scale:.3f} -> "
                     f"{'whole window' if whole_window else 'masked to selection'}"
@@ -4801,7 +5849,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                     placed = 0
                     for seed, response in reversed(results):
                         ok_one, import_message = self._download_and_composite_result(
-                            image, response, context_info, mode, color_info
+                            image, response, context_info, mode, color_info,
+                            clip_to_selection=clip_to_selection,
                         )
                         placed += 1 if ok_one else 0
                     for index, layer in enumerate(image.get_layers()[:placed], start=1):
@@ -4821,7 +5870,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                     # Masked to the selection: the OpenAI model alters pixels
                     # outside it, and only the mask keeps those out of the result
                     import_success, import_message = self._download_and_composite_result(
-                        image, api_response, context_info, mode, color_info
+                        image, api_response, context_info, mode, color_info,
+                        clip_to_selection=clip_to_selection,
                     )
                     if import_success:
                         self._update_progress(progress_label, "✅ AI Inpaint Complete!")
@@ -4829,28 +5879,51 @@ class GimpAIPlugin(Gimp.PlugIn):
                 if import_success:
                     print(f"DEBUG: AI Inpaint Complete - {import_message}")
                 else:
-                    self._update_progress(
-                        progress_label, f"⚠️ Import Failed: {import_message}"
-                    )
-                    Gimp.message(
-                        f"⚠️ AI Generated but Import Failed!\n\nPrompt: {prompt}\nAPI: {api_message}\nImport Error: {import_message}"
-                    )
                     print(f"DEBUG: Import failed: {import_message}")
+                    return (
+                        "AI generated but import failed",
+                        f"API: {api_message}\nImport error: {import_message}",
+                    )
             else:
-                # Check if this was a cancellation vs actual API failure
-                if "cancelled" in api_message.lower():
-                    self._update_progress(
-                        progress_label, "❌ Operation cancelled by user"
-                    )
-                    Gimp.message("❌ Operation cancelled by user")
-                else:
-                    self._update_progress(
-                        progress_label, f"❌ AI API Failed: {api_message}"
-                    )
-                    Gimp.message(f"❌ AI API Failed: {api_message}")
                 print(f"DEBUG: AI API failed: {api_message}")
+                # Check if this was a cancellation vs actual API failure
+                if "cancelled" not in api_message.lower():
+                    return "AI API failed", api_message
+                self._update_progress(
+                    progress_label, "❌ Operation cancelled by user"
+                )
+                Gimp.message("❌ Operation cancelled by user")
 
-            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+            return None
+
+        try:
+            # On failure the dialog stays open with the error shown, so the
+            # user can adjust the prompt, selection or settings and try again
+            while True:
+                try:
+                    failure = attempt()
+                except Exception as e:
+                    print(f"ERROR: Inpaint failed: {e}")
+                    failure = ("Inpaint failed", str(e))
+                if not failure:
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                    )
+
+                # API calls can clear the layer selection
+                if original_selected_layers:
+                    image.set_selected_layers(original_selected_layers)
+                dialog_result = self._offer_retry(
+                    progress_label, *failure,
+                    "Adjust the prompt or selection and press OK to try again.",
+                )
+                if not dialog_result:
+                    # Closed or cancelled; the dialog has already destroyed itself
+                    dialog = None
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+                dialog, progress_label, prompt, selected_mode = dialog_result
 
         finally:
             # Always destroy the dialog
@@ -4892,43 +5965,35 @@ class GimpAIPlugin(Gimp.PlugIn):
             f"DEBUG: Layer composite mode: {len(selected_layers)} layers, mask: {use_mask}"
         )
 
-        try:
-            # Step 2: Get credentials for the configured provider
+        def attempt():
+            """One try at the composite; returns (headline, details) on failure"""
+            # Step 2: Get credentials for the configured provider; read on
+            # every attempt since Settings may have changed them
+            provider = self._get_provider()
             api_key = None
             if provider == "bedrock":
                 self._log_bedrock_environment()
                 try:
                     bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
                 except bedrock_client.BedrockError as e:
-                    self._update_progress(progress_label, "❌ No AWS credentials found!")
-                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
-                    )
+                    return "Amazon Bedrock is not configured", str(e)
 
                 # Bedrock inpainting always needs a mask to know what to change
                 if not use_mask:
-                    self._update_progress(progress_label, "❌ Selection mask required")
-                    Gimp.message(
-                        "❌ Selection Required for Bedrock\n\n"
-                        "Amazon Bedrock composites into a masked region, so it needs "
-                        "a selection to work on.\n\n"
-                        "Please either:\n"
-                        "• Make a selection and tick 'Include selection mask', or\n"
-                        "• Switch the provider back to OpenAI in Settings"
-                    )
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    return (
+                        "Selection required for Bedrock",
+                        "Amazon Bedrock composites into a masked region, so it "
+                        "needs a selection to work on. Make a selection and tick "
+                        "'Include selection mask', or switch the provider back "
+                        "to OpenAI in Settings.",
                     )
             else:
                 api_key = self._get_api_key()
                 if not api_key:
-                    self._update_progress(progress_label, "❌ No OpenAI API key found!")
-                    Gimp.message(
-                        "❌ No OpenAI API key found!\n\nPlease set your API key in:\n- config.json file\n- OPENAI_API_KEY environment variable"
-                    )
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    return (
+                        "No OpenAI API key found",
+                        "Set your API key in Settings, config.json or the "
+                        "OPENAI_API_KEY environment variable.",
                     )
 
             # Use existing layer preparation method
@@ -4943,14 +6008,8 @@ class GimpAIPlugin(Gimp.PlugIn):
                 self._prepare_layers_for_composite(layers_for_api)
             )
             if not success:
-                self._update_progress(
-                    progress_label, f"❌ Layer preparation failed: {message}"
-                )
-                Gimp.message(f"❌ Layer Preparation Failed: {message}")
                 print(f"DEBUG: Layer preparation failed: {message}")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.CANCEL, GLib.Error()
-                )
+                return "Layer preparation failed", message
 
             print(f"DEBUG: Layer preparation succeeded: {message}")
 
@@ -5011,25 +6070,18 @@ class GimpAIPlugin(Gimp.PlugIn):
                         image, context_info, context_info["target_size"]
                     )
                     if provider == "bedrock":
-                        mask_data = self._convert_mask_to_bedrock(mask_data)
+                        mask_data = self._convert_mask_to_luminance(mask_data)
                     print(
                         f"DEBUG: Created context-aware selection mask for composite {target_width}x{target_height}"
                     )
                 else:
                     # ERROR: User checked the mask box but there's no selection
                     print("DEBUG: ERROR - Use mask checked but no selection found")
-                    self._update_progress(
-                        progress_label, "❌ No selection found for mask"
-                    )
-                    Gimp.message(
-                        "❌ Selection Required for Mask\n\n"
-                        "You checked 'Include selection mask' but no selection was found.\n\n"
-                        "Please either:\n"
-                        "• Make a selection on your image, or\n"
-                        "• Uncheck 'Include selection mask'"
-                    )
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    return (
+                        "Selection required for mask",
+                        "'Include selection mask' is ticked but there is no "
+                        "selection. Make a selection on your image, or untick "
+                        "'Include selection mask'.",
                     )
 
             self._update_progress(progress_label, "🚀 Starting AI processing...")
@@ -5046,13 +6098,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                     )
                 )
                 if not flatten_ok:
-                    self._update_progress(
-                        progress_label, f"❌ Layer flattening failed: {flatten_message}"
-                    )
-                    Gimp.message(f"❌ Layer Flattening Failed: {flatten_message}")
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.CANCEL, GLib.Error()
-                    )
+                    return "Layer flattening failed", flatten_message
                 print(f"DEBUG: Calling Bedrock with flattened layers, size={api_size}")
             else:
                 api_image_data = layer_data_list
@@ -5136,23 +6182,46 @@ class GimpAIPlugin(Gimp.PlugIn):
                             "No image data (b64_json or url) in API response"
                         )
                 else:
-                    self._update_progress(progress_label, "❌ No data in API response")
-                    Gimp.message("❌ No data in API response")
+                    return "No data in API response", ""
             else:
-                # Check if this was a cancellation vs actual API failure
-                if "cancelled" in api_message.lower():
-                    self._update_progress(
-                        progress_label, "❌ Operation cancelled by user"
-                    )
-                    Gimp.message("❌ Operation cancelled by user")
-                else:
-                    self._update_progress(
-                        progress_label, f"❌ AI API Failed: {api_message}"
-                    )
-                    Gimp.message(f"❌ AI API Failed: {api_message}")
                 print(f"DEBUG: AI API failed: {api_message}")
+                # Check if this was a cancellation vs actual API failure
+                if "cancelled" not in api_message.lower():
+                    return "AI API failed", api_message
+                self._update_progress(
+                    progress_label, "❌ Operation cancelled by user"
+                )
+                Gimp.message("❌ Operation cancelled by user")
 
-            return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
+            return None
+
+        try:
+            # On failure the dialog stays open with the error shown, so the
+            # user can adjust the prompt, mask or settings and try again
+            while True:
+                try:
+                    failure = attempt()
+                except Exception as e:
+                    print(f"ERROR: Layer composite failed: {e}")
+                    failure = ("Layer composite failed", str(e))
+                if not failure:
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.SUCCESS, GLib.Error()
+                    )
+
+                # API calls can clear the layer selection
+                if original_selected_layers:
+                    image.set_selected_layers(original_selected_layers)
+                dialog_result = self._offer_retry(progress_label, *failure)
+                if not dialog_result:
+                    # Closed or cancelled; the dialog has already destroyed itself
+                    dialog = None
+                    return procedure.new_return_values(
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
+                    )
+                dialog, progress_label, prompt, selected_layers, use_mask = (
+                    dialog_result
+                )
 
         finally:
             # Always destroy the dialog
@@ -5230,8 +6299,9 @@ class GimpAIPlugin(Gimp.PlugIn):
                 print(f"DEBUG: [THREAD] Using size {optimal_size} for generation")
 
                 # Prepare the request data
+                model = self._get_openai_model()
                 data = {
-                    "model": "gpt-image-1",
+                    "model": model,
                     "prompt": prompt,
                     "n": 1,
                     "size": optimal_size,
@@ -5245,13 +6315,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                 req.add_header("Content-Type", "application/json")
                 req.add_header("Authorization", f"Bearer {api_key}")
 
-                print("DEBUG: [THREAD] Sending GPT-Image-1 generation request...")
+                print(f"DEBUG: [THREAD] Sending {model} generation request...")
                 if progress_label:
                     update_progress = self._create_progress_callback(progress_label)
-                    update_progress("🚀 Sending request to GPT-Image-1...")
+                    update_progress(f"🚀 Sending request to {model}...")
 
                 # Send request
-                with urllib.request.urlopen(req) as response:
+                with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT) as response:
                     response_data = response.read().decode("utf-8")
 
                 # Parse response
@@ -5325,15 +6395,18 @@ class GimpAIPlugin(Gimp.PlugIn):
             current_time = time.time()
             elapsed = current_time - start_time
 
-            # Update progress every 10 seconds
-            if progress_label and current_time - last_update_time > 10:
-                minutes = int(elapsed // 60)
+            # Update progress every second
+            if progress_label and current_time - last_update_time >= 1:
+                minutes, seconds = divmod(int(elapsed), 60)
                 if minutes > 0:
                     self._update_progress(
-                        progress_label, f"🎨 Still generating... ({minutes}m elapsed)"
+                        progress_label,
+                        f"🎨 Still generating... ({minutes}m {seconds:02d}s elapsed)",
                     )
                 else:
-                    self._update_progress(progress_label, "🎨 Generating image...")
+                    self._update_progress(
+                        progress_label, f"🎨 Generating image... ({seconds}s elapsed)"
+                    )
                 last_update_time = current_time
 
             # Check for cancellation
@@ -5506,6 +6579,57 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"ERROR: Failed to add layer from data: {str(e)}")
             return False
 
+    def _open_image_from_data(self, image_data, run_mode):
+        """
+        Open generated image data as a new, untitled image in its own window.
+
+        The layer is copied into a fresh image rather than opening the loaded
+        file directly, which would tie the image to the deleted temp file and
+        make Save/Export default to the temp folder.
+        """
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png", mode="wb") as temp_file:
+                temp_file.write(image_data)
+                temp_file_path = temp_file.name
+
+            try:
+                loaded_image = Gimp.file_load(
+                    Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(temp_file_path)
+                )
+            finally:
+                try:
+                    os.unlink(temp_file_path)
+                except OSError:
+                    pass
+
+            if not loaded_image or not loaded_image.get_layers():
+                print("ERROR: Generated image could not be loaded")
+                return None
+
+            source_layer = loaded_image.get_layers()[0]
+            width, height = source_layer.get_width(), source_layer.get_height()
+
+            new_image = Gimp.Image.new(width, height, Gimp.ImageBaseType.RGB)
+            # Creating the image is not an edit the user should be able to undo
+            new_image.undo_disable()
+            new_layer = Gimp.Layer.new_from_drawable(source_layer, new_image)
+            new_layer.set_name("AI Generated")
+            new_image.insert_layer(new_layer, None, 0)
+            new_layer.set_offsets(0, 0)
+            new_image.undo_enable()
+            loaded_image.delete()
+
+            if run_mode == Gimp.RunMode.INTERACTIVE:
+                Gimp.Display.new(new_image)
+                Gimp.displays_flush()
+
+            print(f"DEBUG: Opened generated image as new {width}x{height} image")
+            return new_image
+
+        except Exception as e:
+            print(f"ERROR: Failed to open generated image: {str(e)}")
+            return None
+
     def _download_and_add_layer(self, image, image_url):
         """Download image from URL and add as new layer"""
         try:
@@ -5561,15 +6685,36 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"ERROR: Failed to download and add layer: {str(e)}")
             return False
 
+    def run_image_generator(
+        self, procedure, run_mode, image, drawables, config, run_data
+    ):
+        # Always opens the result as a new image, even when one is open
+        return self.run_layer_generator(
+            procedure, run_mode, None, drawables, config, run_data
+        )
+
     def run_layer_generator(
         self, procedure, run_mode, image, drawables, config, run_data
     ):
         print("DEBUG: Image Generator called!")
 
+        # Without an image there is no canvas to fill, so ask for a size
+        # and open the result as a new image instead of adding a layer
+        new_image_mode = image is None
+        size_presets, allow_custom_size = (
+            self._generation_size_presets() if new_image_mode else (None, False)
+        )
+
         # Show prompt dialog with API key checking (no mode selection for image generator)
         dialog_result = self._show_prompt_dialog(
-            "Image Generator", "", show_mode_selection=False,
+            "Generate New Image" if new_image_mode else "Generate Layer",
+            "", show_mode_selection=False,
+            image=image,
             provider=self._get_provider(),
+            size_presets=size_presets,
+            allow_custom_size=allow_custom_size,
+            # Stability's text-to-image takes no input images
+            show_references=self._get_provider() == "openai",
         )
         if not dialog_result:
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
@@ -5580,81 +6725,108 @@ class GimpAIPlugin(Gimp.PlugIn):
         )
 
         try:
-            # Credentials for whichever provider is configured
-            provider = self._get_provider()
-            api_key = None
-            if provider == "bedrock":
-                self._log_bedrock_environment()
+            done_text = "image" if new_image_mode else "layer"
+
+            # On failure the dialog stays open with the error shown, so the
+            # user can adjust the prompt (or the settings) and try again
+            while True:
+                # Update dialog immediately when processing starts
+                self._update_progress(progress_label, "🎨 Generating image with AI...")
+
                 try:
-                    bedrock_client.generation_credentials(self.config.get("bedrock", {}))
+                    # Credentials for whichever provider is configured; read
+                    # on every attempt since Settings may have changed them
+                    provider = self._get_provider()
+                    api_key = None
+                    if provider == "bedrock":
+                        self._log_bedrock_environment()
+                        bedrock_client.generation_credentials(
+                            self.config.get("bedrock", {})
+                        )
+                    else:
+                        api_key = self._get_api_key()
+                        if not api_key:
+                            raise RuntimeError("API key not available")
+
+                    # Use threaded generation to keep UI responsive like other functions
+                    self._update_progress(
+                        progress_label, "🚀 Starting image generation..."
+                    )
+
+                    if new_image_mode:
+                        width, height = self._dialog_size
+                    else:
+                        width, height = image.get_width(), image.get_height()
+
+                    reference_pngs = []
+                    if provider == "openai":
+                        reference_pngs = self._export_references(
+                            self._dialog_references
+                        )
+                        if reference_pngs:
+                            print(
+                                f"DEBUG: Generating with {len(reference_pngs)} reference image(s)"
+                            )
+
+                    success, message, image_data = self._call_generation_threaded(
+                        prompt,
+                        api_key,
+                        width,
+                        height,
+                        progress_label=progress_label,
+                        exact_size=new_image_mode,
+                        references=reference_pngs,
+                    )
+                    if success and image_data:
+                        if new_image_mode:
+                            result = (
+                                self._open_image_from_data(image_data, run_mode)
+                                is not None
+                            )
+                        else:
+                            # Create layer from the generated image data
+                            result = self._add_layer_from_data(image, image_data)
+                        if not result:
+                            message = f"Failed to add the generated {done_text}"
+                    else:
+                        result = False
                 except bedrock_client.BedrockError as e:
-                    self._update_progress(progress_label, "❌ No AWS credentials found!")
-                    Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
-                    return procedure.new_return_values(
-                        Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+                    result, message = False, f"Amazon Bedrock is not configured: {e}"
+                except Exception as e:
+                    print(f"ERROR: Error generating AI image: {e}")
+                    result, message = False, str(e)
+
+                if result:
+                    self._update_progress(
+                        progress_label, f"✅ AI {done_text} generated successfully!"
                     )
-            else:
-                api_key = self._get_api_key()
-                if not api_key:
-                    self._update_progress(progress_label, "❌ API key not available")
-                    Gimp.message("❌ API key not available")
+                    Gimp.message(f"✅ AI {done_text} generated successfully!")
                     return procedure.new_return_values(
-                        Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+                        Gimp.PDBStatusType.SUCCESS, GLib.Error()
                     )
 
-            # Update dialog immediately when processing starts
-            self._update_progress(progress_label, "🎨 Generating image with AI...")
-
-            # Use threaded generation to keep UI responsive like other functions
-            self._update_progress(progress_label, "🚀 Starting image generation...")
-
-            success, message, image_data = self._call_generation_threaded(
-                prompt,
-                api_key,
-                image.get_width(),
-                image.get_height(),
-                progress_label=progress_label,
-            )
-            if success and image_data:
-                # Create layer from the generated image data
-                layer_success = self._add_layer_from_data(image, image_data)
-                result = layer_success
-            else:
                 # Check if this was a cancellation vs actual failure
                 if "cancelled" in message.lower():
                     self._update_progress(progress_label, "❌ Operation cancelled")
                     Gimp.message("❌ Operation cancelled by user")
-                else:
-                    self._update_progress(
-                        progress_label, f"❌ Generation failed: {message}"
-                    )
-                    Gimp.message(f"❌ Generation failed: {message}")
-                result = False
-            if result:
-                self._update_progress(
-                    progress_label, "✅ GPT-Image-1 layer generated successfully!"
-                )
-                Gimp.message("✅ GPT-Image-1 layer generated successfully!")
-                return procedure.new_return_values(
-                    Gimp.PDBStatusType.SUCCESS, GLib.Error()
-                )
-            else:
-                # Check if this was a cancellation vs actual failure
-                if "cancelled" in message.lower():
                     # For cancellation, return SUCCESS status (user action, not an error)
                     return procedure.new_return_values(
                         Gimp.PDBStatusType.SUCCESS, GLib.Error()
                     )
-                else:
-                    self._update_progress(
-                        progress_label, "❌ Failed to generate GPT-Image-1 layer"
-                    )
-                    Gimp.message("❌ Failed to generate GPT-Image-1 layer")
+
+                dialog_result = self._offer_retry(
+                    progress_label, "Generation failed", message,
+                    "Adjust the prompt and press OK to try again.",
+                )
+                if not dialog_result:
+                    # Closed or cancelled; the dialog has already destroyed itself
+                    dialog = None
                     return procedure.new_return_values(
-                        Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error()
+                        Gimp.PDBStatusType.CANCEL, GLib.Error()
                     )
+                dialog, progress_label, prompt, _ = dialog_result
         except Exception as e:
-            error_msg = f"Error generating GPT-Image-1 layer: {str(e)}"
+            error_msg = f"Error generating AI image: {str(e)}"
             self._update_progress(progress_label, f"❌ Error: {str(e)}")
             print(f"ERROR: {error_msg}")
             Gimp.message(f"❌ {error_msg}")
@@ -5667,18 +6839,15 @@ class GimpAIPlugin(Gimp.PlugIn):
                 dialog.destroy()
 
     def run_settings(self, procedure, run_mode, image, drawables, config, run_data):
-        print("DEBUG: Testing HTTP functionality...")
+        """Open the settings dialog straight from the Filters > AI menu"""
+        print("DEBUG: Settings called from menu")
+        if run_mode != Gimp.RunMode.INTERACTIVE:
+            return procedure.new_return_values(
+                Gimp.PDBStatusType.CALLING_ERROR, GLib.Error()
+            )
 
-        # Test HTTP request
-        success, message = self._test_http_request()
-
-        if success:
-            Gimp.message(f"✅ {message}")
-            print(f"DEBUG: HTTP test succeeded: {message}")
-        else:
-            Gimp.message(f"❌ {message}")
-            print(f"DEBUG: HTTP test failed: {message}")
-
+        self._init_gimp_ui()
+        self._show_settings_dialog(None)
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
 

@@ -33,6 +33,85 @@ def get_optimal_openai_shape(width, height):
         return (1024, 1024)
 
 
+# GPT-Image-2.x takes any WIDTHxHEIGHT within these limits, unlike gpt-image-1's
+# three fixed shapes.
+GPT_IMAGE_SIZE_STEP = 16
+GPT_IMAGE_MAX_EDGE = 3840
+GPT_IMAGE_MAX_ASPECT = 3.0
+GPT_IMAGE_MIN_PIXELS = 655360
+GPT_IMAGE_LIMIT_PIXELS = 8294400
+# OpenAI marks output above 2560x1440 as experimental, so stay at or below it
+GPT_IMAGE_MAX_PIXELS = 2560 * 1440
+
+
+def is_valid_gpt_image_size(width, height):
+    """Whether (width, height) is a request size GPT-Image-2.x accepts."""
+    step = GPT_IMAGE_SIZE_STEP
+    return (
+        width > 0 and height > 0
+        and width % step == 0 and height % step == 0
+        and max(width, height) <= GPT_IMAGE_MAX_EDGE
+        and max(width, height) <= GPT_IMAGE_MAX_ASPECT * min(width, height)
+        and GPT_IMAGE_MIN_PIXELS <= width * height <= GPT_IMAGE_LIMIT_PIXELS
+    )
+
+
+def get_gpt_image_shape(width, height, max_pixels=GPT_IMAGE_MAX_PIXELS):
+    """
+    Request size for GPT-Image-2.x that keeps content at native resolution.
+
+    Content is only scaled down, to fit max_pixels and the edge limit, or up when
+    it is below the API's minimum area. Whatever the content cannot fill - an
+    aspect ratio beyond 3:1, or rounding to multiples of 16 - becomes padding
+    through calculate_padding_for_shape().
+
+    Args:
+        width, height: Content size in pixels
+        max_pixels: Largest request area to use
+
+    Returns:
+        tuple: (target_width, target_height) satisfying is_valid_gpt_image_size()
+    """
+    if width <= 0 or height <= 0:
+        return (1024, 1024)
+
+    step = GPT_IMAGE_SIZE_STEP
+    max_pixels = max(GPT_IMAGE_MIN_PIXELS, min(max_pixels, GPT_IMAGE_LIMIT_PIXELS))
+
+    # Widen content more extreme than 3:1 to a 3:1 box; the rest is padding
+    box_w = max(width, height / GPT_IMAGE_MAX_ASPECT)
+    box_h = max(height, width / GPT_IMAGE_MAX_ASPECT)
+
+    scale = min(
+        1.0,
+        (max_pixels / (box_w * box_h)) ** 0.5,
+        GPT_IMAGE_MAX_EDGE / max(box_w, box_h),
+    )
+    if box_w * box_h * scale * scale < GPT_IMAGE_MIN_PIXELS:
+        scale = (GPT_IMAGE_MIN_PIXELS / (box_w * box_h)) ** 0.5
+
+    target_w = max(step, int(round(box_w * scale / step)) * step)
+    target_h = max(step, int(round(box_h * scale / step)) * step)
+
+    # Rounding can overshoot a limit by a step; nudge back inside
+    while target_w * target_h > max_pixels or max(target_w, target_h) > GPT_IMAGE_MAX_EDGE:
+        if target_w >= target_h:
+            target_w -= step
+        else:
+            target_h -= step
+    if target_w > target_h * GPT_IMAGE_MAX_ASPECT:
+        target_w = int(target_h * GPT_IMAGE_MAX_ASPECT) // step * step
+    if target_h > target_w * GPT_IMAGE_MAX_ASPECT:
+        target_h = int(target_w * GPT_IMAGE_MAX_ASPECT) // step * step
+    while target_w * target_h < GPT_IMAGE_MIN_PIXELS:
+        if target_w <= target_h:
+            target_w += step
+        else:
+            target_h += step
+
+    return (target_w, target_h)
+
+
 def calculate_padding_for_shape(current_width, current_height, target_width, target_height):
     """
     Calculate padding needed to fit content into target OpenAI shape.
@@ -419,8 +498,10 @@ def validate_context_info(context_info):
     if not isinstance(target_shape, tuple) or len(target_shape) != 2:
         return False, "target_shape must be a tuple of (width, height)"
     valid_shapes = [(1024, 1024), (1536, 1024), (1024, 1536)]
-    if target_shape not in valid_shapes:
-        return False, f"target_shape must be one of {valid_shapes}"
+    if target_shape not in valid_shapes and not is_valid_gpt_image_size(*target_shape):
+        return False, (
+            f"target_shape must be one of {valid_shapes} or a valid GPT-Image-2.x size"
+        )
     
     return True, ""
 

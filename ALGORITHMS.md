@@ -1,11 +1,22 @@
-# OpenAI Image Generation Algorithms
+# Image Preparation Algorithms
 
-This document describes the algorithms for preparing images for OpenAI's DALL-E API and processing the results.
+This document describes how images are prepared for the image APIs (OpenAI
+GPT-Image and Amazon Bedrock / Stability AI) and how the results are placed
+back into GIMP. All of the math lives in `coordinate_utils.py`, which has no
+GIMP dependencies.
 
-## OpenAI API Constraints
+Which sizing path is used depends on the provider and model:
 
-The DALL-E API accepts three specific image dimensions:
-- **Square**: 1024 � 1024
+| Provider / model | Sizing | Section |
+|---|---|---|
+| OpenAI gpt-image-1 | Three fixed shapes, content scaled and padded | 1-6 |
+| OpenAI GPT-Image-2.x | Any size in multiples of 16, native resolution | [8](#8-gpt-image-2x-sizing) |
+| Amazon Bedrock (Stability) | Any size, ~1MP native-resolution window | [7](#7-native-resolution-context-window) |
+
+## OpenAI gpt-image-1 Constraints
+
+gpt-image-1 accepts three specific image dimensions:
+- **Square**: 1024 × 1024
 - **Landscape**: 1536 × 1024  
 - **Portrait**: 1024 × 1536
 
@@ -13,17 +24,17 @@ When dimensions aren't specified, the API chooses based on input, making it diff
 
 ## Current Implementation Status
 
-###  Implemented
-- Square context extraction (512�512, 768�768, or 1024�1024)
-- Basic mask generation for selections
-- Context padding calculation
-- Extension beyond image boundaries
+### Implemented
+- Shape selection for gpt-image-1 (square, landscape, portrait)
+- Context extraction with padding and scaling to the target shape
+- Mask generation from the GIMP selection (on a duplicate of the image)
+- Native-resolution context windows for Bedrock and GPT-Image-2.x
+- Free-size request shapes for GPT-Image-2.x
 
-### L Not Implemented
-- Non-square shape selection
-- Smart boundary-aware padding
-- Aspect ratio preservation
+### Not Implemented
+- Smart boundary-aware padding using image content
 - Advanced mask feathering
+- Tiling for images larger than the API limits
 
 ## Core Algorithms
 
@@ -300,32 +311,75 @@ def generate_layer_mask(context_info, selection_mask):
         return layer_mask
 ```
 
+### 7. Native-Resolution Context Window
+
+`calculate_native_context(img_width, img_height, sel_bounds)` is used for
+Bedrock and for focused inpainting with GPT-Image-2.x. Instead of snapping a
+tight crop to a fixed shape, it grows a window around the selection to about
+one megapixel (`NATIVE_TARGET_PIXELS`) of real pixels:
+
+1. Margin = max(64px, 25% of the selection's longer side)
+2. Side = max(√target_pixels, selection + 2 × margin)
+3. Centre the window on the selection and slide it back inside the image
+   rather than shrinking it; clip it when the image is smaller
+4. Trim to the accepted aspect range, then scale down only if the window
+   exceeds the target area - never up
+
+Stability downsamples inputs above about a megapixel, which measurably hurt
+quality in testing, so the target is kept at ~1MP rather than at the 9.4MP the
+API would accept. Padding is always zero on this path.
+
+### 8. GPT-Image-2.x Sizing
+
+The GPT-Image-2.x models accept any `WIDTHxHEIGHT` that satisfies
+`is_valid_gpt_image_size()`:
+
+- both sides multiples of 16 (`GPT_IMAGE_SIZE_STEP`)
+- longest side ≤ 3840 (`GPT_IMAGE_MAX_EDGE`)
+- aspect ratio ≤ 3:1 (`GPT_IMAGE_MAX_ASPECT`)
+- 655,360 ≤ area ≤ 8,294,400 pixels
+
+`get_gpt_image_shape(width, height, max_pixels)` picks the request size:
+
+1. Content more extreme than 3:1 is widened to a 3:1 box; the extra becomes padding
+2. Scale = min(1, √(max_pixels / area), 3840 / longest side) - content is only
+   reduced, except when it is below the minimum area, where it is enlarged to
+   reach it
+3. Round both sides to multiples of 16, then nudge back inside the limits if
+   rounding overshot one
+4. The remainder is padded with `calculate_padding_for_shape()` as for gpt-image-1
+
+`max_pixels` defaults to 2560×1440 (`GPT_IMAGE_MAX_PIXELS`): OpenAI marks larger
+output as experimental. When the user explicitly picks a size for a new image,
+the plugin passes the full API limit instead, which is how the 4K presets work.
+
+Focused inpainting takes the window from section 7 and then fits it with
+`get_gpt_image_shape()`, so only rounding leaves a few pixels of padding.
+`validate_context_info()` accepts either a gpt-image-1 shape or any valid
+GPT-Image-2.x size.
+
 ## Implementation Notes
 
 ### Current Limitations
 
-1. **Square-only extraction**: Current implementation only works with square extracts (512�512, 768�768, 1024�1024)
-2. **Boundary extension**: Extends beyond image boundaries, creating artificial context
-3. **No aspect ratio preservation**: Forces everything to squares, causing distortion
+1. **Upscaling with gpt-image-1**: a small selection's context is blown up to
+   1024px or more, so most of what the model sees is interpolated. The
+   native-resolution paths (sections 7 and 8) avoid this
+2. **Padding**: padding is filled with flat colour rather than image content
 
 ### Recommended Improvements
 
-1. **Smart Shape Selection**
-   - Analyze image/selection aspect ratio
-   - Choose optimal OpenAI shape (square/landscape/portrait)
-   - Minimize padding and scaling
-
-2. **Boundary-Aware Context**
+1. **Boundary-Aware Context**
    - Prefer shifting context window over extending beyond image
    - Only extend beyond boundaries when selection is at edge
    - Use image content for padding when possible
 
-3. **Progressive Mask Feathering**
+2. **Progressive Mask Feathering**
    - Variable feather radius based on selection size
    - Directional feathering for edge selections
    - Preserve hard edges where appropriate
 
-4. **Multi-Resolution Support**
+3. **Multi-Resolution Support**
    - Handle images larger than OpenAI max dimensions
    - Tile-based processing for very large images
    - Smart downsampling for quality preservation
@@ -344,7 +398,7 @@ padded = pad_image_to_shape(image, *target_shape)
 ### Example 2: Focused Inpainting
 ```python
 # Inpaint a selection with context
-selection = (500, 300, 700, 500)  # 200�200 selection
+selection = (500, 300, 700, 500)  # 200×200 selection
 context = extract_context_with_selection(
     image=(1920, 1080),
     selection=selection,

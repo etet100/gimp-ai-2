@@ -9,14 +9,14 @@ Fork of [lukaso/gimp-ai](https://github.com/lukaso/gimp-ai), branched from
 
 ## Summary
 
-`Filters → AI` now has five entries. The provider is chosen once in
-`Filters → AI → Settings` and applies throughout.
+The provider is chosen once in `Filters → AI → Settings` and applies
+throughout.
 
 | Feature | OpenAI | Bedrock | Notes |
 |---|---|---|---|
 | Inpainting | yes | yes | |
 | Layer Composite | yes | yes | Bedrock flattens the layers first - see [Layer composite](#layer-composite) |
-| Image Generator | yes | yes | Bedrock generation runs in its own region - see [Generation](#generation) |
+| Generate Layer / Generate New Image | yes | yes | Bedrock generation runs in its own region - see [Generation](#generation) |
 | **Erase Object** | — | yes | New. Three alternative erasures per run |
 | **Generative Upscale** | — | yes | New. Fast, Conservative or Creative |
 
@@ -69,17 +69,18 @@ flag rather than applying one rule everywhere.
 
 ### New
 
-| File | Lines | Purpose |
-|---|---|---|
-| `bedrock_client.py` | 545 | SigV4 signing, credential resolution, request building. No GIMP dependencies, standard library only. |
-| `tests/test_gimp_pipeline.py` | 239 | Mask and layer-flattening tests that run inside headless GIMP. |
-| `tests/test_native_context.py` | 90 | Native-resolution context window, pure and offline. |
-| `tests/test_erase_in_gimp.py` | 199 | Full erase path against a real photo, including the procedure itself (makes live calls). |
-| `tests/test_generate_in_gimp.py` | 100 | Text-to-image end to end (makes a live call). |
-| `tests/test_fit_in_gimp.py` | 109 | Generated-layer canvas fitting, no API calls. |
-| `tests/test_upscale_in_gimp.py` | 144 | Upscale variants and dialog construction (live calls optional). |
-| `tests/probe_placement.py` | 95 | Compares layer placement methods; found the Gegl no-op. |
-| `BEDROCK.md` | — | This document. |
+| File | Purpose |
+|---|---|
+| `bedrock_client.py` | SigV4 signing, credential resolution, request building. No GIMP dependencies, standard library only. |
+| `tests/test_gimp_pipeline.py` | Mask and layer-flattening tests that run inside headless GIMP. |
+| `tests/test_native_context.py` | Native-resolution context window, pure and offline. |
+| `tests/test_erase_in_gimp.py` | Full erase path against a real photo, including the procedure itself (makes live calls). |
+| `tests/test_inpaint_in_gimp.py` | Inpainting variations end to end (makes live calls). |
+| `tests/test_generate_in_gimp.py` | Text-to-image end to end (makes a live call). |
+| `tests/test_fit_in_gimp.py` | Generated-layer canvas fitting, no API calls. |
+| `tests/test_upscale_in_gimp.py` | Upscale variants and dialog construction (live calls optional). |
+| `tests/probe_placement.py` | Compares layer placement methods; found the Gegl no-op. |
+| `BEDROCK.md` | This document. |
 
 ### Modified
 
@@ -92,7 +93,7 @@ flag rather than applying one rule everywhere.
 | `README.md` | Erase Object usage, Bedrock configuration, sandboxed-GIMP caveat |
 | `INSTALL.md` | Three required files instead of two |
 | `TROUBLESHOOTING.md` | Third required file in the folder listing |
-| `CHANGELOG.md` | Unreleased section |
+| `CHANGELOG.md` | 0.15.0 section |
 | `.github/copilot-instructions.md` | Architecture, mask conventions, layer placement rule, integration tests |
 | `coordinate_utils.py` | `calculate_native_context()` for native-resolution windows |
 | `.gitignore` | Test output artefacts |
@@ -230,28 +231,28 @@ is the real ceiling.
 
 ### Added
 
-| Method | Line | Purpose |
-|---|---|---|
-| `_restrict_config_permissions` | 147 | chmod 600 on the config file |
-| `_get_provider` | 250 | Reads `api_provider`; falls back to OpenAI if `bedrock_client` is missing |
-| `_credentials_ready` | 258 | Single credential gate for both providers |
-| `_log_bedrock_environment` | 277 | Prints what the plugin can see; masks secret values |
-| `_on_clear_bedrock_credentials` | 1360 | Removes stored AWS credentials |
-| `_flatten_layers_for_bedrock` | 2411 | Composites selected layers into one image for Bedrock |
-| `_convert_mask_to_bedrock` | 3637 | Converts mask polarity between providers |
-| `_call_bedrock_edit` | 3693 | Bedrock InvokeModel call |
-| `_calculate_native_context_extraction` | 3781 | Native-resolution context window |
-| `_call_bedrock_erase` | 3817 | Object-erase model call |
-| `_call_erase_variations_threaded` | 3868 | Runs the variations concurrently |
-| `_call_edit_threaded` | 3922 | Dispatches to the configured provider |
-| `run_erase_object` | 4432 | The Erase Object procedure |
-| `run_upscale` | 4314 | The Generative Upscale procedure |
-| `_show_upscale_dialog` | 1942 | Variant dropdown and prompt |
-| `_call_bedrock_upscale` | 2040 | Upscale model call |
-| `_export_layer_for_upscale` | 2092 | Exports the active layer, reduced to fit input limits |
-| `_add_layer_from_bytes` | 5338 | Adds WebP/JPEG results without canvas fitting |
-| `_call_bedrock_generation` | 2132 | Text-to-image call |
-| `_call_generation_threaded` | 2259 | Dispatches generation to the configured provider |
+| Method | Purpose |
+|---|---|
+| `_restrict_config_permissions` | chmod 600 on the config file |
+| `_get_provider` | Reads `api_provider`; falls back to OpenAI if `bedrock_client` is missing |
+| `_credentials_ready` | Single credential gate for both providers |
+| `_log_bedrock_environment` | Prints what the plugin can see; masks secret values |
+| `_on_clear_bedrock_credentials` | Removes stored AWS credentials |
+| `_flatten_layers_for_bedrock` | Composites selected layers into one image for Bedrock |
+| `_convert_mask_to_luminance` | Converts the OpenAI mask to white-on-black (Bedrock mask, OpenAI mask hint) |
+| `_call_bedrock_edit` | Bedrock InvokeModel call |
+| `_calculate_native_context_extraction` | Native-resolution context window |
+| `_call_bedrock_erase` | Object-erase model call |
+| `_run_bedrock_variations` | Runs erase/inpaint variations concurrently |
+| `_call_edit_threaded` | Dispatches to the configured provider |
+| `run_erase_object` | The Erase Object procedure |
+| `run_upscale` | The Generative Upscale procedure |
+| `_show_upscale_dialog` | Variant dropdown and prompt |
+| `_call_bedrock_upscale` | Upscale model call |
+| `_export_layer_for_upscale` | Exports the active layer, reduced to fit input limits |
+| `_add_layer_from_bytes` | Adds WebP/JPEG results without canvas fitting |
+| `_call_bedrock_generation` | Text-to-image call |
+| `_call_generation_threaded` | Dispatches generation to the configured provider |
 
 `_call_bedrock_edit` returns the same `{"data": [{"b64_json": ...}]}` shape the
 OpenAI path returns, so the entire compositing pipeline is provider-agnostic and
@@ -468,7 +469,7 @@ fixed for both.
 
 ## Mask conventions
 
-The two providers disagree, which is why `_convert_mask_to_bedrock` exists:
+The two providers disagree, which is why `_convert_mask_to_luminance` exists:
 
 | Provider | Inpaint area | Preserve area |
 |---|---|---|
@@ -591,7 +592,8 @@ batch run. It rebinds the plugin's methods onto a plain object: instantiating
         "negative_prompt": "",
         "seed": 0,
         "grow_mask": 5,
-        "erase_variations": 3
+        "erase_variations": 3,
+        "inpaint_variations": 3
     }
 }
 ```
@@ -601,10 +603,10 @@ batch run. It rebinds the plugin's methods onto a plain object: instantiating
 | `region` | `us-east-1` | inpaint, erase, upscale |
 | `model_id` | inpaint model | Inpainting |
 | `erase_model_id` | erase model | Erase Object |
-| `generation_region` | `us-west-2` | Image Generator |
-| `generation_model_id` | SD 3.5 Large | Image Generator |
-| `erase_variations` | 3 | Erase Object |
-| `grow_mask` | 5 | inpaint, erase |
+| `generation_region` | `us-west-2` | Generate Layer, Generate New Image |
+| `generation_model_id` | SD 3.5 Large | Generate Layer, Generate New Image |
+| `erase_variations` | Erase Object |
+| `grow_mask` | inpaint, erase |
 | `upscale_variant` | `conservative` | Generative Upscale |
 | `upscale_creativity` | 0.35 | Conservative and Creative upscale |
 | `seed`, `negative_prompt` | 0, empty | most models |
@@ -612,7 +614,8 @@ batch run. It rebinds the plugin's methods onto a plain object: instantiating
 
 `grow_mask` (0-20) expands and softens the mask edge; 5 measured better than 20,
 which grew far enough to swallow neighbouring subjects. `erase_variations` (1-4)
-is how many alternative erasures Erase Object produces. `generation_region` and
+is how many alternative erasures Erase Object produces; `inpaint_variations`
+(1-4) does the same for Inpainting. `generation_region` and
 `generation_model_id` are separate because generation is not available in the
 region the editing models use.
 

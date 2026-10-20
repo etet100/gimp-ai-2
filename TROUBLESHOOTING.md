@@ -14,7 +14,7 @@ Common issues and solutions for the GIMP AI Plugin.
 
 **Solutions**:
 
-1. **Verify you installed BOTH files** in the correct structure:
+1. **Verify you installed all three files** in the correct structure:
 
    ```
    plug-ins/
@@ -56,17 +56,19 @@ Common issues and solutions for the GIMP AI Plugin.
 - Use matching directory (3.0 vs 3.1)
 - Install in correct version-specific folder
 
-### Missing coordinate_utils.py File
+### Missing coordinate_utils.py or bedrock_client.py File
 
-**Symptoms**: Plugin appears but crashes when used, or error about missing module
+**Symptoms**: Plugin appears but crashes when used, or error about missing module.
+Without `bedrock_client.py` the plugin still loads, but Amazon Bedrock is
+unavailable and every feature falls back to OpenAI.
 
-**Solution**: You need BOTH files for the plugin to work:
+**Solution**: You need all three files for the plugin to work:
 
-1. Make sure `coordinate_utils.py` is in the same folder as `gimp-ai-plugin.py`
-2. Both files must be in the `gimp-ai-plugin` subdirectory
-3. Download the release ZIP from GitHub to get both files together
+1. Make sure `coordinate_utils.py` and `bedrock_client.py` are in the same folder as `gimp-ai-plugin.py`
+2. All three files must be in the `gimp-ai-plugin` subdirectory
+3. Download the release ZIP from GitHub to get them together
 
-> **Tip**: The release ZIP package includes both files in the correct structure. See [INSTALL.md](INSTALL.md) Step 1.
+> **Tip**: The release ZIP package includes all three files in the correct structure. See [INSTALL.md](INSTALL.md) Step 1.
 
 ---
 
@@ -78,10 +80,10 @@ Common issues and solutions for the GIMP AI Plugin.
 
 **Solutions**:
 
-1. Go to `Filters > AI > Settings` (if available)
-2. Or use any AI feature and click "Configure" in the error dialog
-3. Enter your OpenAI API key
-4. Settings are automatically saved to GIMP preferences
+1. Go to `Filters > AI > Settings...`
+2. Or use any AI feature and click "Configure Now" in the warning
+3. Enter your OpenAI API key (or switch the provider to Amazon Bedrock)
+4. Settings are saved to `config.json` in the plugin's GIMP profile folder
 
 ### Invalid API Key Error
 
@@ -250,7 +252,7 @@ Include this information:
 
 - **OS and version** (e.g., "Windows 11", "Ubuntu 22.04", "macOS Ventura")
 - **GIMP version** (exact version from Help → About)
-- **Plugin version** (0.8.0-beta)
+- **Plugin version** (the `VERSION` line near the top of `gimp-ai-plugin.py`)
 - **Error messages** from GIMP Error Console
 - **Steps to reproduce** the issue
 - **Image details** (size, format, what you were trying to do)

@@ -2,7 +2,8 @@
     "api_provider": "openai",
     "openai": {
         "api_key": "your-openai-api-key-here",
-        "model": "gpt-image-1",
+        "model": "gpt-image-2.5-flare",
+        "mask_hint": true,
         "endpoint": "https://api.openai.com/v1"
     },
     "bedrock": {

@@ -7,13 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-20
+
 ### Added
+
+- **GPT-Image-2.5 models for OpenAI**: an *Image model* picker in Settings
+  offers GPT-Image-2.5 Flare (fast, the new default), GPT-Image-2.5 Sunburst
+  (slower, more precise) and GPT-Image-1 (legacy). Stored as `openai.model`;
+  a hand-edited model id is kept selectable rather than lost
+
+  - The 2.x models take any size in multiples of 16 (up to 3840px per side,
+    3:1 aspect, 655,360-8,294,400 pixels) instead of gpt-image-1's three fixed
+    shapes, so requests are sized by `get_gpt_image_shape()` in
+    `coordinate_utils.py`. Content is kept at native resolution and only
+    reduced above 2560x1440, which OpenAI marks as experimental
+  - Focused inpainting on the 2.x models uses the same ~1MP native-resolution
+    context window as Bedrock, instead of blowing a tight crop up to 1024px
+  - **Mask hint**: the 2.x models see the edits mask as a blacked-out hole and
+    tend to paint around it, so the selection is also sent as a white-on-black
+    image and the prompt points at it. On by default for 2.x, off for
+    gpt-image-1; override with `openai.mask_hint`
+  - `input_fidelity` is sent to gpt-image-1 only; the 2.x models reject it
+  - Request timeout raised to 300s, since the newer models are slower
+
+- **Reference images (OpenAI)**: Inpainting, Generate Layer and Generate New
+  Image can take other open images as references. Pick them from thumbnail
+  dropdowns; more slots can be added up to the API's 16 input images (the
+  edited image and mask hint count towards that). References are flattened and
+  reduced to 1536px on the longest side, and the prompt tells the model which
+  input image is which. Last choices are remembered while the images stay open
+
+- **Generate New Image** (`Filters → AI → Generate New Image`, also
+  `File → Create → Generate New Image`): available with no image open; asks for
+  a size and opens the result as a new image. With GPT-Image-2.x it offers
+  presets up to 4K plus a custom size; gpt-image-1 and Bedrock offer the shapes
+  those models support
+
+- **`Filters → AI → Settings...`** opens the settings dialog directly, also with
+  no image open
+
+- **Inpainting variations on Bedrock**: three alternative results per run as
+  separate layers (`AI Inpaint 1 of 3` ...), run concurrently. The whole
+  context window is pasted back without a selection-shaped layer mask, which
+  removes the rectangular seam. Configurable via `bedrock.inpaint_variations`
+  (1-4). OpenAI keeps a single call, since its edits endpoint regenerates the
+  whole window
+
+- **Clip result to selection** option in the inpainting dialog. Unticked, the
+  layer mask is kept but disabled, so edges the model drew outside the selection
+  stay visible and the clip is one click away
+
+- **Try Again** after a failed request: the dialog stays open with the error
+  shown and the prompt and options kept, so a transient error (throttling,
+  timeout) or a missing selection can be fixed and retried without starting over
+
+- Every dialog shows which provider, model and main parameters the operation
+  will use, refreshed when Settings change
 
 - **Amazon Bedrock inpainting provider**: inpainting can now run through Amazon
   Bedrock instead of OpenAI, using Stability AI's inpainting model
   (`stability.stable-image-inpaint-v1:0`) via its cross-region inference profile.
 
-  - Applies to **AI Inpainting**, **AI Layer Composite**, **AI Image Generator**
+  - Applies to **AI Inpainting**, **AI Layer Composite**, image generation
     and the new **AI Erase Object**
   - Provider is selected in `Filters → AI → Settings`
   - Credentials come from an access key/secret typed into Settings, a Bedrock
@@ -56,6 +111,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Image Generator is now Generate Layer** (`Filters → AI → Generate Layer`).
+  It needs an open image but no selected layer, and adds a layer that covers
+  the canvas. With GPT-Image-2.x the layer is requested at the canvas's own
+  aspect ratio instead of the nearest of three shapes
+- Full Image inpainting still sends the whole image, but its result layer is
+  now masked to the selection as in Focused mode
+- Dialogs were redesigned: numbered sections with icons, a larger prompt box,
+  and a status area with a bold headline and wrapping, selectable details so
+  long API errors can be read and copied. Styling follows the GIMP theme
+- Masks of 4 MB or more are rejected before upload with a clear message,
+  instead of failing at the OpenAI edits endpoint
 - Generated layers are now scaled to cover the canvas and centred, instead of
   being dropped in at the model's own resolution and leaving a gap. Uses NoHalo
   for enlarging and LoHalo for reducing (GIMP 3 has no Lanczos)
@@ -111,6 +177,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only sees the combined pixels. A selection mask is required
 - Stability's SDXL 1.0 (`stability.stable-diffusion-xl-v1`) is no longer
   available on Bedrock, so the current Stability inpainting model is used
+
+## [0.9.0] - [0.14.0] - 2025-11-16 / 2025-11-17
+
+Release-tooling versions, bumped automatically by the release workflow.
+
+### Added
+
+- `VERSION` constant in `gimp-ai-plugin.py`, `tools/bump_version.py` and the
+  GitHub Actions bump-and-release workflow (see `RELEASE.md`)
+- Automated installer `install_plugin.py`, shipped in the release ZIP
+
+### Fixed
+
+- Installer detects every installed GIMP 3.x version and lets the user choose,
+  defaulting to the latest stable one (0.12.0)
+- Debug images are saved to the system temp directory instead of a hard-coded
+  `/tmp`, which does not exist on Windows; coordinate tests updated (0.14.0)
+- Version bumping and release workflow fixes (0.9.0 - 0.11.0)
 
 ## [0.8.0-beta] - 2024-10-04
 
@@ -188,13 +272,13 @@ This is a beta release. Please report:
 4. Performance with different image sizes
 5. General usability feedback
 
-**Report issues at**: [GitHub Issues](https://github.com/yourusername/gimp-ai/issues)
+**Report issues at**: [GitHub Issues](https://github.com/lukaso/gimp-ai/issues)
 
 ---
 
 ### Support
 
-- **Requirements**: GIMP 3.0.4+ or 3.1.x, Internet connection
-- **Installation**: Copy 2 files to GIMP plugins directory
-- **Configuration**: Use `Filters > AI` in GIMP and chose one of the options, then click `Settings` in the dialog
+- **Requirements**: GIMP 3.0.4 or newer, Internet connection
+- **Installation**: Copy 3 files to GIMP plugins directory, or run `install_plugin.py`
+- **Configuration**: `Filters > AI > Settings...` in GIMP
 - **Documentation**: See README.md and TROUBLESHOOTING.md

@@ -2,16 +2,16 @@
 
 A Python plugin for GIMP 3.0.4+ that integrates AI image generation capabilities directly into GIMP. This is a **beta release** seeking testers on all platforms.
 
-Supports **OpenAI's gpt-image-1** and **Amazon Bedrock** (Stability AI) as alternative providers. Object removal and generative upscaling are Bedrock-only, since OpenAI has no equivalent models.
+Supports **OpenAI's GPT-Image models** (GPT-Image-2.5 Flare and Sunburst, plus the legacy gpt-image-1) and **Amazon Bedrock** (Stability AI) as alternative providers. Object removal and generative upscaling are Bedrock-only, since OpenAI has no equivalent models.
 
 ## ✨ Features
 
 - **🎨 AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
 - **🧹 AI Erase Object**: Remove something from a photo and fill the gap from its surroundings - select it, run it, no prompt, three alternatives to choose from
 - **🔍 AI Generative Upscale**: Enlarge the active layer with a model instead of plain resampling - Fast, Conservative or Creative
-- **🖼️ AI Image Generation**: Create new images from text descriptions as new layers
+- **🖼️ AI Image Generation**: Create images from text descriptions - as a new layer or as a new image, optionally guided by reference images
 - **🔄 AI Layer Composite**: Intelligently blend AI content into existing images
-- **⚙️ Easy Configuration**: Built-in settings dialog, no external config files needed
+- **⚙️ Easy Configuration**: Built-in settings dialog (`Filters → AI → Settings...`), no external config files needed
 - **☁️ Choice of provider**: OpenAI or Amazon Bedrock, chosen in Settings
 
 ## 📋 Requirements
@@ -38,7 +38,7 @@ Done! The installer handles everything automatically.
 
 1. **Download 3 files**: `gimp-ai-plugin.py`, `coordinate_utils.py` and `bedrock_client.py`
 2. **Create folder**: Make a `gimp-ai-plugin` folder in your GIMP plug-ins directory
-3. **Copy files**: Put both files in that folder, restart GIMP
+3. **Copy files**: Put all three files in that folder, restart GIMP
 
 ### Need Help? 📖
 
@@ -83,9 +83,20 @@ plug-ins/
 ### OpenAI
 
 1. **Get an OpenAI API key** from [platform.openai.com](https://platform.openai.com)
-2. In GIMP: go to `Filters → AI → Settings`
+2. In GIMP: go to `Filters → AI → Settings...`
 3. **Paste your API key** (starts with `sk-`)
-4. Click OK - it's saved automatically!
+4. **Pick the image model**:
+   - **GPT-Image-2.5 Flare** - fast, the default
+   - **GPT-Image-2.5 Sunburst** - slower, more precise
+   - **GPT-Image-1** - legacy; only three fixed sizes (1024x1024, 1536x1024, 1024x1536)
+5. Click Save - it's stored automatically!
+
+The GPT-Image-2.5 models accept any size in multiples of 16, so inpainting
+works at the native resolution of your image instead of being scaled to a fixed
+shape. They also tend to paint *around* a masked hole rather than into it, so
+the plugin sends the selection once more as a white-on-black image and tells the
+model to work inside it. Set `"mask_hint": false` in the `openai` section of
+`config.json` to turn that off.
 
 > **First time?** See [INSTALL.md](INSTALL.md) for detailed API key instructions.
 
@@ -94,7 +105,7 @@ plug-ins/
 Bedrock serves models on demand - there is no model-access request to submit
 first, so this is just credentials and a region.
 
-1. In GIMP: go to `Filters → AI → Settings`
+1. In GIMP: go to `Filters → AI → Settings...`
 2. Set **Inpainting Provider** to *Amazon Bedrock*
 3. Set the **AWS region** (default `us-east-1`)
 4. Provide credentials one of these ways:
@@ -121,9 +132,9 @@ first, so this is just credentials and a region.
 | Generative Upscale - Fast | `stability.stable-fast-upscale-v1:0` | `region` | — |
 | Generative Upscale - Conservative | `stability.stable-conservative-upscale-v1:0` | `region` | — |
 | Generative Upscale - Creative | `stability.stable-creative-upscale-v1:0` | `region` | — |
-| Image Generator | `stability.sd3-5-large-v1:0` | `generation_region` (`us-west-2`) | `generation_model_id` |
+| Generate Layer / Generate New Image | `stability.sd3-5-large-v1:0` | `generation_region` (`us-west-2`) | `generation_model_id` |
 
-Everything except Image Generator runs in the region you set in Settings
+Everything except generation runs in the region you set in Settings
 (default `us-east-1`). Generation is separate because Stability's text-to-image
 models are not offered there; the same credentials work in both regions and
 there is nothing extra to enable.
@@ -151,22 +162,37 @@ selection mask is required to tell it which region to work on.
 **Fill selected areas with AI-generated content using text prompts**
 
 1. **Open image** in GIMP
-2. **Make a selection** of area to inpaint (or no selection for full image)
+2. **Make a selection** of the area to inpaint (required)
 3. **Go to** `Filters → AI → Inpainting`
-4. **Choose processing mode**:
-   - **🔍 Focused (High Detail)**: Best for small edits, maximum resolution, selection required
-   - **🖼️ Full Image (Consistent)**: Best for large changes, works with or without selection
-5. **Enter prompt** (e.g., "blue sky with clouds", "remove the object")
-6. **Result**: New layer with AI-generated content, automatically masked to selection area
+4. **Enter prompt** (e.g., "blue sky with clouds", "remove the object")
+5. **Choose processing mode**:
+   - **🔍 Focused (High Detail)**: Best for small edits - the model sees a window around the selection
+   - **🖼️ Full Image (Consistent)**: Best for large changes - the model sees the whole image
+6. **Clip result to selection** (on by default): untick to keep the edges the
+   model drew outside the selection. The layer mask is still created, just
+   disabled, so the clip is one click away (`Layer → Mask → Disable Layer Mask`) and
+   the mask can be painted to allow only part of the overflow
+7. **Reference images** (OpenAI only, optional): pick other open images for the
+   model to draw on. Two slots are shown; **Add reference** adds more
+8. **Result**: New layer with AI-generated content, masked to the selection
 
 **Selection Mask Behavior:**
 
 - **Soft masks**: AI can redraw content _outside_ the selection to maintain visual coherence
 - **With selection**: Final result is masked to show only within selected area, but AI considers surrounding context
-- **No selection** (Full Image mode): Entire image is processed and replaced
 - **Smart feathering**: Automatic edge blending for seamless integration
 
 ⚠️ **Important**: The AI model may modify areas outside your selection to create coherent results. Only the final output is masked to your selection.
+
+**On Amazon Bedrock** you get **three alternative results** as three layers
+(`AI Inpaint 1 of 3` ...), only the first visible, generated concurrently. Each
+is the whole context window pasted back without a selection mask: Stability only
+changes the masked region, so this blends without a seam. Set
+`inpaint_variations` in the `bedrock` section of `config.json` to change the
+count (1-4).
+
+If a request fails, the dialog stays open with the error and a **Try Again**
+button, keeping your prompt and options.
 
 ### AI Erase Object
 
@@ -196,8 +222,8 @@ Two things it does differently from Inpainting, both of which matter for
 quality:
 
 - The context window is taken at **native resolution**, sized to roughly one
-  megapixel around the selection. Inpainting snaps to the OpenAI shapes, which
-  for a small selection means upscaling a tight crop: a 160px selection became a
+  megapixel around the selection. Inpainting with gpt-image-1 snaps to its
+  three fixed shapes, which for a small selection means upscaling a tight crop: a 160px selection became a
   288px crop blown up 3.56x, so 92% of what the model saw was interpolated.
 - The whole window is pasted back rather than masked to the selection, so the
   blending the model already did across the mask edge is preserved instead of
@@ -236,18 +262,31 @@ Requires Amazon Bedrock as the provider.
 
 ### AI Image Generation
 
-1. **Open or create** any GIMP document
-2. **Go to** `Filters → AI → Image Generator`
-3. **Enter prompt** (e.g., "a red dragon on mountain")
-4. **New layer created** with generated image
+There are two entries:
+
+- **`Filters → AI → Generate Layer`** - adds the result as a layer covering the
+  canvas of the open image
+- **`Filters → AI → Generate New Image`** (also `File → Create → Generate New
+  Image`) - works with no image open; asks for a size and opens the result as a
+  new image
+
+1. **Go to** one of the entries above
+2. **Enter prompt** (e.g., "a red dragon on mountain")
+3. **Pick a size** (Generate New Image only). With GPT-Image-2.5 there are
+   presets up to 4K and a custom size, rounded to multiples of 16; sizes above
+   2560x1440 are marked experimental by OpenAI. gpt-image-1 and Bedrock offer
+   the shapes their models support
+4. **Reference images** (OpenAI only, optional): pick open images to guide the
+   result - the request then goes to OpenAI's edits endpoint without a mask
 
 Generation always produces a **whole-canvas layer** - it does not read your
 selection. To generate into a selected area, use **Inpainting**, which is exactly
 that operation: a prompt plus a selection mask.
 
 Generation models return their own resolution (Stability gives about a megapixel
-at the nearest aspect ratio it supports; OpenAI one of three fixed sizes), which
-rarely matches your canvas. The generated layer is therefore scaled to **cover**
+at the nearest aspect ratio it supports; gpt-image-1 one of three fixed sizes;
+GPT-Image-2.5 the canvas aspect ratio, up to 2560x1440), which rarely matches
+your canvas exactly. The generated layer is therefore scaled to **cover**
 the canvas and centred: the tighter axis matches exactly and the other overhangs,
 so there is no gap and the excess can be cropped or repositioned.
 
@@ -283,7 +322,7 @@ use. See [Configuration](#-configuration).
 ## 🐛 Find Issues?
 
 - Check [TROUBLESHOOTING.md](TROUBLESHOOTING.md) first
-- Report at: [GitHub Issues](https://github.com/yourusername/gimp-ai/issues)
+- Report at: [GitHub Issues](https://github.com/lukaso/gimp-ai/issues)
 
 ## 📚 Documentation
 

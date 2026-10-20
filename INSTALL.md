@@ -70,7 +70,7 @@ You need **exactly 3 files**:
 
 1. Go to the [Releases page](https://github.com/lukaso/gimp-ai/releases)
 2. Download the latest `gimp-ai-plugin-vX.X.X.zip` file
-3. Extract the ZIP file - you'll see a `gimp-ai-plugin` folder containing both files
+3. Extract the ZIP file - you'll see a `gimp-ai-plugin` folder containing all three files
 
 ### Option C: Download Individual Files
 
@@ -79,7 +79,7 @@ You need **exactly 3 files**:
 3. Go back and click on `coordinate_utils.py` → Click "Raw" → Save the file
 4. Do the same for `bedrock_client.py`
 
-> **Important**: Keep these two files together - the plugin won't work without both!
+> **Important**: Keep these three files together - the plugin won't work without all of them!
 
 ---
 
@@ -197,7 +197,7 @@ mkdir ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin
 
 ## 📋 Step 4: Copy the Plugin Files
 
-Now copy **both files** you downloaded into the `gimp-ai-plugin` folder you just created.
+Now copy **all three files** you downloaded into the `gimp-ai-plugin` folder you just created.
 
 ### Where to Copy:
 
@@ -274,19 +274,20 @@ Now you'll set up your OpenAI API key so the plugin can access AI features.
 
 **Method 1 (Recommended):**
 
-1. In GIMP, go to `Filters` → `AI` → `Settings`
-2. Paste your API key in the "OpenAI API Key" field
-3. Click OK
+1. In GIMP, go to `Filters` → `AI` → `Settings...`
+2. Paste your API key in the "Enter new API key" field
+3. Optionally pick the **Image model** (GPT-Image-2.5 Flare is the default)
+4. Click Save
 
-**Method 2 (If Settings menu isn't available):**
+**Method 2 (from any AI feature):**
 
-1. Try any AI feature (e.g., `Filters` → `AI` → `Image Generator`)
-2. You'll see an error dialog about missing API key
-3. Click "Configure" in the error dialog
+1. Try any AI feature (e.g., `Filters` → `AI` → `Generate Layer`)
+2. You'll see a warning about the missing API key
+3. Click "Configure Now" in the warning
 4. Paste your API key
 5. Click OK
 
-The plugin will **automatically save** your API key in GIMP's preferences - you only need to enter it once!
+The plugin will **automatically save** your API key to its `config.json` in the GIMP profile folder - you only need to enter it once!
 
 ---
 
@@ -298,13 +299,16 @@ Let's verify everything is working:
 2. **Look for the AI menu**: `Filters` → `AI`
 3. You should see these options:
    - 🎨 **Inpainting** - Fill areas with AI-generated content
-   - 🖼️ **Image Generator** - Create new images from text
+   - 🧹 **Erase Object** - Remove a selected object (Amazon Bedrock only)
+   - 🔍 **Generative Upscale** - Enlarge a layer with AI (Amazon Bedrock only)
+   - 🖼️ **Generate Layer** - Create a new layer from text
+   - 🆕 **Generate New Image** - Create a new image from text (also in `File` → `Create`)
    - 🔄 **Layer Composite** - Blend layers with AI
-   - ⚙️ **Settings** - Configure API keys
+   - ⚙️ **Settings...** - Configure provider, model and API keys
 
 ### Quick Test:
 
-1. Go to `Filters` → `AI` → `Image Generator`
+1. Go to `Filters` → `AI` → `Generate Layer`
 2. Enter a simple prompt like "blue sky with clouds"
 3. Click OK
 4. After a few seconds, you should see a new layer with AI-generated content!
@@ -318,10 +322,11 @@ Let's verify everything is working:
 **Check these things:**
 
 1. ✅ **Did you restart GIMP completely?** (Quit and reopen)
-2. ✅ **Are both files in the right place?**
+2. ✅ **Are all three files in the right place?**
    ```
    plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
    plug-ins/gimp-ai-plugin/coordinate_utils.py
+   plug-ins/gimp-ai-plugin/bedrock_client.py
    ```
 3. ✅ **Is the folder named exactly `gimp-ai-plugin`?** (not `gimp_ai_plugin` or `gimp-ai`)
 4. ✅ **Do you have GIMP 3.0.4 or newer?** Check: `Help` → `About GIMP`
@@ -362,7 +367,7 @@ Congratulations! You've successfully installed the GIMP AI Plugin.
 
 - 📖 Read the [README.md](README.md) to learn about all features
 - 🎨 Try the **Inpainting** feature on a photo
-- 🖼️ Generate some AI images with **Image Generator**
+- 🖼️ Generate some AI images with **Generate Layer** or **Generate New Image**
 - 📚 Check [CHANGELOG.md](CHANGELOG.md) for what's new
 
 ### Getting Help:
