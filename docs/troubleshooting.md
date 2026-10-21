@@ -1,12 +1,17 @@
-# Troubleshooting Guide
+---
+title: Troubleshooting
+nav_order: 5
+---
+
+# Troubleshooting
 
 Common issues and solutions for the GIMP AI Plugin.
 
-> **First time installing?** Check the [INSTALL.md](INSTALL.md) guide for complete step-by-step instructions.
+> **First time installing?** Check the [Installation](installation.md) guide for complete step-by-step instructions.
 
 ---
 
-## 🚨 Installation Issues
+## Installation Issues
 
 ### Plugin Not Appearing in GIMP Menus
 
@@ -30,7 +35,7 @@ Common issues and solutions for the GIMP AI Plugin.
    - **Linux**: `~/.config/GIMP/3.1/plug-ins/gimp-ai-plugin/` (or 3.0)
    - **Windows**: `%APPDATA%\GIMP\3.1\plug-ins\gimp-ai-plugin\` (or 3.0)
 
-   > **Tip**: See [INSTALL.md](INSTALL.md) for detailed instructions on finding these directories.
+   > **Tip**: See [Installation](installation.md#step-2-find-your-gimp-plugin-directory) for detailed instructions on finding these directories.
 
 3. **Check file permissions** (Linux/macOS):
 
@@ -68,11 +73,11 @@ unavailable and every feature falls back to OpenAI.
 2. All three files must be in the `gimp-ai-plugin` subdirectory
 3. Download the release ZIP from GitHub to get them together
 
-> **Tip**: The release ZIP package includes all three files in the correct structure. See [INSTALL.md](INSTALL.md) Step 1.
+> **Tip**: The release ZIP package includes all three files in the correct structure. See [Installation, Step 1](installation.md#step-1-download-the-plugin-files).
 
 ---
 
-## 🔧 Configuration Issues
+## Configuration Issues
 
 ### "No API Key Configured" Error
 
@@ -110,7 +115,7 @@ unavailable and every feature falls back to OpenAI.
 
 ---
 
-## 🖥️ Platform-Specific Issues
+## Platform-Specific Issues
 
 ### macOS Issues
 
@@ -157,7 +162,7 @@ mkdir -p ~/.config/GIMP/3.1/plug-ins/gimp-ai-plugin/
 
 ---
 
-## 🌐 Network & API Issues
+## Network & API Issues
 
 ### "Connection timeout" Errors
 
@@ -192,7 +197,7 @@ mkdir -p ~/.config/GIMP/3.1/plug-ins/gimp-ai-plugin/
 
 ---
 
-## 🐛 Runtime Errors
+## Runtime Errors
 
 ### "Selection not found" Error
 
@@ -227,7 +232,7 @@ mkdir -p ~/.config/GIMP/3.1/plug-ins/gimp-ai-plugin/
 
 ---
 
-## 📊 Performance Optimization
+## Performance Optimization
 
 ### Reduce Processing Time
 
@@ -237,7 +242,7 @@ mkdir -p ~/.config/GIMP/3.1/plug-ins/gimp-ai-plugin/
 
 ---
 
-## 🆘 Getting Help
+## Getting Help
 
 ### Before Reporting Issues
 
@@ -271,7 +276,7 @@ Include this information:
 
 ---
 
-## 📝 Logs and Debugging
+## Logs and Debugging
 
 ### Enable Debug Output
 

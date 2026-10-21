@@ -1,0 +1,52 @@
+title: GIMP AI Plugin
+description: >-
+  AI inpainting, object removal, generative upscaling and image generation
+  inside GIMP 3, powered by OpenAI GPT-Image or Amazon Bedrock (Stability AI).
+url: https://etet100.github.io
+baseurl: /gimp-ai-2
+
+remote_theme: just-the-docs/just-the-docs@v0.10.1
+plugins:
+  - jekyll-remote-theme
+  - jekyll-relative-links
+  - jekyll-seo-tag
+
+relative_links:
+  enabled: true
+  collections: false
+
+color_scheme: light
+search_enabled: true
+heading_anchors: true
+
+aux_links:
+  "GitHub":
+    - "https://github.com/etet100/gimp-ai-2"
+  "Download":
+    - "https://github.com/etet100/gimp-ai-2/releases/latest"
+aux_links_new_tab: true
+
+nav_external_links:
+  - title: Changelog
+    url: https://github.com/etet100/gimp-ai-2/blob/main/CHANGELOG.md
+  - title: Report an issue
+    url: https://github.com/etet100/gimp-ai-2/issues
+
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: "https://github.com/etet100/gimp-ai-2"
+gh_edit_branch: "main"
+gh_edit_source: docs
+gh_edit_view_mode: "edit"
+
+back_to_top: true
+back_to_top_text: "Back to top"
+
+footer_content: >-
+  MIT licensed. Fork of <a href="https://github.com/lukaso/gimp-ai">lukaso/gimp-ai</a>.
+
+kramdown:
+  input: GFM
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false

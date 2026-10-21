@@ -60,6 +60,15 @@ OPENAI_IMAGE_MODELS = [
 ]
 DEFAULT_OPENAI_MODEL = "gpt-image-2.5-flare"
 
+# OpenAI has no dedicated erase model, so Erase Object on OpenAI is prompted
+# inpainting with an instruction that forbids inventing a replacement
+OPENAI_ERASE_PROMPT = (
+    "Remove the object in this region completely, including its shadow and "
+    "reflection. Reconstruct only the background that would be visible behind "
+    "it, continuing the surrounding textures, lines, lighting and perspective. "
+    "Do not add any new object, person, animal, text or logo."
+)
+
 # Newer models are slower at high quality, so allow them more time
 OPENAI_TIMEOUT = 300
 
@@ -621,6 +630,18 @@ class GimpAIPlugin(Gimp.PlugIn):
             f"Instruction for the region: {prompt}"
         )
 
+    def _has_selection(self, image):
+        """
+        Is anything selected?
+
+        Gimp.Selection.bounds() returns (success, non_empty, x1, y1, x2, y2).
+        success is True whenever the call works, selection or not, and with
+        nothing selected the bounds cover the whole image - so testing [0]
+        treated every image as fully selected.
+        """
+        bounds = Gimp.Selection.bounds(image)
+        return len(bounds) >= 6 and bool(bounds[1])
+
     def _get_provider(self):
         """Which API provider handles inpainting: 'openai' or 'bedrock'"""
         provider = self.config.get("api_provider", "openai")
@@ -984,7 +1005,17 @@ class GimpAIPlugin(Gimp.PlugIn):
             model = self._get_openai_model()
             labels = dict(OPENAI_IMAGE_MODELS)
             params = ["quality high", "1 image"]
-            if operation in ("inpaint", "composite"):
+            if operation == "erase":
+                openai_cfg = self.config.get("openai", {})
+                count = max(1, min(4, int(openai_cfg.get("erase_variations", 1))))
+                grow = max(0, min(50, int(openai_cfg.get("erase_grow_mask", 8))))
+                params = [
+                    "quality high",
+                    "1 image" if count == 1 else f"{count} variations",
+                    f"selection grown {grow}px",
+                    "fixed removal prompt",
+                ]
+            if operation in ("inpaint", "composite", "erase"):
                 params.append("moderation low")
                 params.append(
                     "input fidelity high"
@@ -2394,9 +2425,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Check if there's actually a selection - if not, use full image for transformation
             selection_bounds = Gimp.Selection.bounds(image)
-            has_real_selection = (
-                selection_bounds[0] if len(selection_bounds) > 0 else False
-            )
+            has_real_selection = self._has_selection(image)
 
             if has_real_selection:
                 # Use actual selection bounds
@@ -2447,7 +2476,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             selection_bounds = Gimp.Selection.bounds(image)
             print(f"DEBUG: Selection bounds raw: {selection_bounds}")
 
-            if len(selection_bounds) < 5 or not selection_bounds[0]:
+            if not self._has_selection(image):
                 print("DEBUG: No selection found, using center area")
                 # Use new shape-aware function with no selection
                 return extract_context_with_selection(
@@ -5430,6 +5459,126 @@ class GimpAIPlugin(Gimp.PlugIn):
             if original_selected_layers:
                 image.set_selected_layers(original_selected_layers)
 
+    def _replace_selection(self, image, channel):
+        """Make channel the image's selection again"""
+        pdb = Gimp.get_pdb()
+        select_proc = pdb.lookup_procedure("gimp-image-select-item")
+        select_config = select_proc.create_config()
+        select_config.set_property("image", image)
+        select_config.set_property("operation", Gimp.ChannelOps.REPLACE)
+        select_config.set_property("item", channel)
+        select_proc.run(select_config)
+
+    def _erase_with_openai(self, image, progress_label):
+        """
+        Erase Object through the OpenAI edits endpoint; returns (headline,
+        details) on failure, like attempt().
+
+        An approximation of Stability's erase model. Two differences shape it:
+        the model regenerates the whole window, so the result is masked back to
+        the selection rather than pasted whole; and a selection that hugs the
+        outline leaves a ghost, so it is grown first (openai.erase_grow_mask,
+        the counterpart of Bedrock's grow_mask) and the layer mask feathered.
+        """
+        api_key = self._get_api_key()
+        if not api_key:
+            return (
+                "No OpenAI API key found",
+                "Set your API key in Settings, config.json or the "
+                "OPENAI_API_KEY environment variable.",
+            )
+
+        openai_cfg = self.config.get("openai", {})
+        grow = max(0, min(50, int(openai_cfg.get("erase_grow_mask", 8))))
+        variations = max(1, min(4, int(openai_cfg.get("erase_variations", 1))))
+
+        # Grown for the mask and the layer mask alike, restored afterwards
+        original_selection = Gimp.Selection.save(image)
+        try:
+            if grow:
+                Gimp.Selection.grow(image, grow)
+
+            self._update_progress(progress_label, "🔍 Reading image...")
+            if self._openai_accepts_any_size():
+                context_info = self._calculate_gpt_image_context_extraction(image)
+            else:
+                context_info = self._calculate_context_extraction(image)
+            color_info = self._sample_boundary_colors(image, context_info)
+
+            success, message, image_data = self._extract_context_region(
+                image, context_info
+            )
+            if not success:
+                return "Context extraction failed", message
+
+            self._update_progress(progress_label, "🎭 Creating mask...")
+            mask_data = self._create_context_mask(
+                image, context_info, context_info["target_size"]
+            )
+
+            api_image_data, prompt = image_data, OPENAI_ERASE_PROMPT
+            if self._openai_mask_hint():
+                # Converted here: GIMP image operations need the main thread
+                api_image_data = [image_data, self._convert_mask_to_luminance(mask_data)]
+                prompt = self._prompt_with_mask_hint(prompt, 0)
+
+            target_w, target_h = context_info["target_shape"]
+            size = f"{target_w}x{target_h}"
+            self._update_progress(
+                progress_label,
+                "🚀 Erasing..." if variations == 1
+                else f"🚀 Erasing ({variations} variations)...",
+            )
+            # The seed only tells the calls apart; OpenAI takes none
+            api_success, api_message, results = self._run_bedrock_variations(
+                variations,
+                lambda seed: self._call_openai_edit(
+                    api_image_data, mask_data, prompt, api_key, size
+                ),
+                progress_label,
+                name="OpenAI erase API call",
+            )
+
+            if not api_success:
+                if "cancelled" not in api_message.lower():
+                    return "Erase failed", api_message
+                self._update_progress(progress_label, "❌ Cancelled")
+                Gimp.message("❌ Operation cancelled by user")
+                return None
+
+            self._update_progress(progress_label, "Placing results...")
+            placed = 0
+            last_message = ""
+            for seed, response in reversed(results):
+                ok, last_message = self._download_and_composite_result(
+                    image, response, context_info, "contextual", color_info,
+                    clip_to_selection=True,
+                )
+                placed += 1 if ok else 0
+            if not placed:
+                return "Erased but import failed", last_message
+
+            for index, layer in enumerate(image.get_layers()[:placed], start=1):
+                layer.set_name(
+                    "AI Erase Result" if placed == 1
+                    else f"AI Erase {index} of {placed}"
+                )
+                layer.set_visible(index == 1)
+            Gimp.displays_flush()
+            self._update_progress(
+                progress_label,
+                "✅ Object erased!" if placed == 1
+                else f"✅ {placed} variations - toggle layer visibility to compare",
+            )
+            print(f"DEBUG: OpenAI erase complete - {placed} variation(s) placed")
+            return None
+        finally:
+            try:
+                self._replace_selection(image, original_selection)
+            except Exception as e:
+                print(f"DEBUG: Could not restore selection after erase: {e}")
+            image.remove_channel(original_selection)
+
     def run_erase_object(self, procedure, run_mode, image, drawables, config, run_data):
         """
         Erase Object - remove what is selected and fill from the surroundings.
@@ -5441,8 +5590,7 @@ class GimpAIPlugin(Gimp.PlugIn):
         print("DEBUG: AI Erase Object called!")
         original_selected_layers = image.get_selected_layers()
 
-        selection_bounds = Gimp.Selection.bounds(image)
-        if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+        if not self._has_selection(image):
             Gimp.message(
                 "❌ No Selection Found!\n\n"
                 "Erase Object removes whatever is selected.\n\n"
@@ -5453,21 +5601,19 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
 
         provider = self._get_provider()
-        if provider != "bedrock" or bedrock_client is None:
+        if provider == "bedrock":
+            self._log_bedrock_environment()
+            try:
+                bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
+            except bedrock_client.BedrockError as e:
+                Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
+                return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+        elif not self._get_api_key():
             Gimp.message(
-                "❌ Erase Object requires Amazon Bedrock\n\n"
-                "It uses Stability's object-erase model, which has no OpenAI "
-                "equivalent.\n\n"
-                "Set the inpainting provider to Amazon Bedrock in "
-                "Filters → AI → Settings."
+                "❌ No OpenAI API key found!\n\n"
+                "Set your API key in Filters → AI → Settings, or switch the "
+                "provider to Amazon Bedrock for Stability's dedicated erase model."
             )
-            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
-
-        self._log_bedrock_environment()
-        try:
-            bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
-        except bedrock_client.BedrockError as e:
-            Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
 
         self._init_gimp_ui()
@@ -5510,9 +5656,12 @@ class GimpAIPlugin(Gimp.PlugIn):
         def attempt():
             """One try at the erase; returns (headline, details) on failure"""
             # The selection can change between attempts
-            selection_bounds = Gimp.Selection.bounds(image)
-            if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+            if not self._has_selection(image):
                 return "No selection", "Select the object you want gone."
+
+            # Settings may have switched the provider between attempts
+            if self._get_provider() != "bedrock":
+                return self._erase_with_openai(image, progress_label)
 
             self._update_progress(progress_label, "🔍 Reading image...")
             context_info = self._calculate_native_context_extraction(image)
@@ -5611,8 +5760,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         # Step 1: Check for active selection FIRST
         print("DEBUG: Checking for active selection...")
-        selection_bounds = Gimp.Selection.bounds(image)
-        has_selection = len(selection_bounds) >= 5 and selection_bounds[0]
+        has_selection = self._has_selection(image)
 
         if not has_selection:
             print("DEBUG: No selection found - showing error message")
@@ -5661,8 +5809,7 @@ class GimpAIPlugin(Gimp.PlugIn):
         def attempt():
             """One try at the inpaint; returns (headline, details) on failure"""
             # The selection can change between attempts
-            selection_bounds = Gimp.Selection.bounds(image)
-            if not (len(selection_bounds) >= 5 and selection_bounds[0]):
+            if not self._has_selection(image):
                 return "No selection", "Select the area you want to inpaint."
 
             # Step 3: Get credentials for the configured provider; read on
@@ -6048,7 +6195,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 print("DEBUG: Preparing mask for primary layer...")
                 # Use the same context-based mask approach as inpainting
                 selection_bounds = Gimp.Selection.bounds(image)
-                if len(selection_bounds) >= 5 and selection_bounds[0]:
+                if self._has_selection(image):
                     print("DEBUG: Creating context-aware mask for layer composite...")
 
                     # Get selection bounds
