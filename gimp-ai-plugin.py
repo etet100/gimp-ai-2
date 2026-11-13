@@ -52,6 +52,21 @@ except ImportError as e:
     bedrock_client = None
     print(f"DEBUG: Bedrock support unavailable: {e}")
 
+# DeepSeek support covers prompt rewriting and an OpenAI-compatible image
+# provider. Optional for the same reason as Bedrock: older installs only
+# copied the original files.
+try:
+    import deepseek_client
+except ImportError as e:
+    deepseek_client = None
+    print(f"DEBUG: DeepSeek support unavailable: {e}")
+
+try:
+    import custom_provider
+except ImportError as e:
+    custom_provider = None
+    print(f"DEBUG: Custom provider support unavailable: {e}")
+
 # OpenAI image models offered in Settings, as (model id, label)
 OPENAI_IMAGE_MODELS = [
     ("gpt-image-2.5-flare", "GPT-Image-2.5 Flare (fast, recommended)"),
@@ -143,6 +158,7 @@ SECTION_ICONS = {
     "provider": ["preferences-system", "preferences-system-symbolic"],
     "openai": ["gimp-prefs-folders-plug-ins", "network-server-symbolic"],
     "bedrock": ["gimp-prefs-system-resources", "network-server-symbolic"],
+    "deepseek": ["applications-science-symbolic", "dialog-information-symbolic"],
     "history": ["gimp-undo-history", "document-open-recent-symbolic"],
     "debug": ["gimp-prefs-playground", "dialog-warning-symbolic"],
 }
@@ -380,7 +396,15 @@ class GimpAIPlugin(Gimp.PlugIn):
         gpt-image-1 has three fixed shapes and Stability picks its own size from
         an aspect ratio, so only GPT-Image-2.x offers larger and custom sizes.
         """
-        if self._get_provider() == "bedrock":
+        provider = self._get_provider()
+        if provider == "custom":
+            return [
+                ("Square 512x512", (512, 512)),
+                ("Landscape 768x512", (768, 512)),
+                ("Portrait 512x768", (512, 768)),
+                ("Square 1024x1024", (1024, 1024)),
+            ], True
+        if provider == "bedrock":
             return [
                 ("Square 1:1", (1024, 1024)),
                 ("Landscape 3:2", (1536, 1024)),
@@ -388,7 +412,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 ("Widescreen 16:9", (1920, 1080)),
                 ("Tall 9:16", (1080, 1920)),
             ], False
-        if not self._openai_accepts_any_size():
+        if provider != "deepseek" and not self._openai_accepts_any_size():
             return [
                 ("Square 1024x1024", (1024, 1024)),
                 ("Landscape 1536x1024", (1536, 1024)),
@@ -630,6 +654,116 @@ class GimpAIPlugin(Gimp.PlugIn):
             f"Instruction for the region: {prompt}"
         )
 
+    def _get_deepseek_settings(self):
+        """DeepSeek connection settings, including environment fallbacks"""
+        if deepseek_client is None:
+            return {}
+        return deepseek_client.resolve_settings(self.config)
+
+    def _deepseek_ready(self):
+        """Is a DeepSeek API key available for prompt refinement?"""
+        return deepseek_client is not None and deepseek_client.credentials_ready(
+            self.config
+        )
+
+    def _auto_enhance_enabled(self):
+        """Refine prompts automatically when a DeepSeek key is configured?"""
+        return self._deepseek_ready() and bool(
+            self.config.get("deepseek", {}).get("auto_enhance", False)
+        )
+
+    def _create_enhance_button(self):
+        """Toolbar button that rewrites the dialog's prompt with DeepSeek"""
+        button = Gtk.Button(label="Enhance with DeepSeek")
+        button.set_image(
+            Gtk.Image.new_from_icon_name(
+                "applications-science-symbolic", Gtk.IconSize.BUTTON
+            )
+        )
+        button.set_always_show_image(True)
+        button.set_tooltip_text(
+            "Rewrite the prompt with DeepSeek before generating"
+            if self._deepseek_ready()
+            else "Add a DeepSeek API key in Settings to refine prompts"
+        )
+        button.set_sensitive(self._deepseek_ready())
+        return button
+
+    def _refresh_enhance_button(self, button):
+        """Re-enable the DeepSeek button after Settings may have added a key"""
+        button.set_sensitive(self._deepseek_ready())
+        button.set_tooltip_text(
+            "Rewrite the prompt with DeepSeek before generating"
+            if self._deepseek_ready()
+            else "Add a DeepSeek API key in Settings to refine prompts"
+        )
+
+    def _refine_prompt_with_deepseek(self, prompt, operation, progress_label=None):
+        """
+        Rewrite a prompt through DeepSeek on a worker thread.
+
+        Returns (success, message, refined_prompt). The refined prompt is None
+        when the request failed, in which case message explains why.
+        """
+        if deepseek_client is None:
+            return False, "DeepSeek support is unavailable (deepseek_client.py is missing)", None
+        if not self._deepseek_ready():
+            return False, "No DeepSeek API key configured", None
+
+        if progress_label:
+            self._update_progress(progress_label, "✨ Refining prompt with DeepSeek...")
+            self._flush_ui()
+
+        def operation_call():
+            success, message = deepseek_client.enhance_prompt(
+                self.config, prompt, operation, opener=self._make_url_request
+            )
+            return {
+                "success": success,
+                "message": "Prompt refined" if success else message,
+                "data": message if success else None,
+            }
+
+        success, message, refined = self._run_threaded_operation(
+            operation_call,
+            "DeepSeek prompt refinement",
+            progress_label,
+            max_wait_time=90,
+        )
+        if success and refined:
+            if progress_label:
+                self._update_progress(
+                    progress_label, "✅ Prompt refined with DeepSeek - review it and continue"
+                )
+            return True, "Prompt refined", refined
+        return False, message, None
+
+    def _maybe_refine_prompt(
+        self, prompt, operation, progress_label=None, already_refined=False
+    ):
+        """
+        Apply the configured automatic DeepSeek refinement, falling back to the
+        original prompt (with a status warning) when the request fails.
+        """
+        if already_refined or not self._auto_enhance_enabled():
+            return prompt
+
+        success, message, refined = self._refine_prompt_with_deepseek(
+            prompt, operation, progress_label
+        )
+        if success and refined:
+            print("DEBUG: DeepSeek refined the prompt automatically")
+            return refined
+
+        print(f"DEBUG: DeepSeek refinement skipped: {message}")
+        if progress_label:
+            self._update_progress(
+                progress_label,
+                f"⚠ DeepSeek refinement failed: {message}\nUsing the original prompt.",
+            )
+            self._flush_ui()
+        return prompt
+
     def _has_selection(self, image):
         """
         Is anything selected?
@@ -643,10 +777,16 @@ class GimpAIPlugin(Gimp.PlugIn):
         return len(bounds) >= 6 and bool(bounds[1])
 
     def _get_provider(self):
-        """Which API provider handles inpainting: 'openai' or 'bedrock'"""
+        """Which API provider handles image operations."""
         provider = self.config.get("api_provider", "openai")
         if provider == "bedrock" and bedrock_client is None:
             print("DEBUG: Bedrock configured but module missing, falling back to OpenAI")
+            return "openai"
+        if provider == "deepseek" and deepseek_client is None:
+            print("DEBUG: DeepSeek configured but module missing, falling back to OpenAI")
+            return "openai"
+        if provider == "custom" and custom_provider is None:
+            print("DEBUG: Custom provider configured but module missing, falling back to OpenAI")
             return "openai"
         return provider
 
@@ -667,7 +807,143 @@ class GimpAIPlugin(Gimp.PlugIn):
                 print(f"DEBUG: Bedrock credentials not ready: {e}")
                 self._log_bedrock_environment()
                 return False
+        if provider == "deepseek":
+            if deepseek_client is None:
+                return False
+            ready = deepseek_client.credentials_ready(self.config)
+            print(f"DEBUG: DeepSeek credentials ready: {ready}")
+            return ready
+        if provider == "custom":
+            if custom_provider is None:
+                return False
+            try:
+                settings = custom_provider.resolve_settings(self.config)
+                custom_provider.parse_extra_parameters(settings["extra_parameters"])
+                return bool(settings["base_url"])
+            except custom_provider.CustomProviderError as e:
+                print(f"DEBUG: Custom provider not ready: {e}")
+                return False
         return bool(self._get_api_key())
+
+    def _get_provider_api_key(self, provider):
+        """API key for the selected image provider ('' when missing)"""
+        if provider == "deepseek":
+            return self._get_deepseek_settings().get("api_key", "")
+        if provider == "custom":
+            return self.config.get("custom", {}).get("api_key", "")
+        return self._get_api_key()
+
+    def _provider_accepts_any_size(self, provider):
+        """Does this provider take free image sizes instead of gpt-image-1 shapes?"""
+        if provider == "deepseek":
+            return bool(
+                self.config.get("deepseek", {}).get("accepts_any_size", True)
+            )
+        if provider == "custom":
+            return True
+        return provider == "openai" and self._openai_accepts_any_size()
+
+    def _provider_mask_hint(self, provider):
+        """Send the selection as an extra white-on-black hint image?"""
+        if provider == "deepseek":
+            return bool(
+                self.config.get("deepseek", {}).get("mask_hint", True)
+            )
+        return provider == "openai" and self._openai_mask_hint()
+
+    def _provider_capability(self, provider, operation):
+        """Whether a provider supports an operation, including config overrides."""
+        if custom_provider is None:
+            return True
+        name = "t2i" if operation == "generate" else operation
+        return custom_provider.provider_capabilities(self.config, provider).get(name, False)
+
+    def _set_operation_availability(self, button, provider, operation):
+        """Disable an unavailable action and explain why in its tooltip."""
+        supported = self._provider_capability(provider, operation)
+        if not supported:
+            button.set_sensitive(False)
+        button.set_tooltip_text(
+            None if supported else
+            f"{operation.replace('_', ' ').title()} is disabled for this provider. "
+            "Enable its capability in config.json for experimentation."
+        )
+        if not supported:
+            button.set_label("Unavailable")
+        return supported
+
+    def _custom_timeout(self):
+        """Configured custom backend timeout, or its slow-hardware default."""
+        if custom_provider is None:
+            return 600
+        try:
+            return custom_provider.resolve_settings(self.config)["timeout"]
+        except custom_provider.CustomProviderError:
+            return custom_provider.DEFAULT_TIMEOUT
+
+    def _custom_generation_size(self, width, height):
+        """Custom backends take direct sizes; round to SD-friendly multiples of 8."""
+        target_w = max(64, int(round(int(width) / 8.0)) * 8)
+        target_h = max(64, int(round(int(height) / 8.0)) * 8)
+        return f"{target_w}x{target_h}"
+
+    def _maybe_enhance_custom_prompt(self, prompt, progress_label=None):
+        """Enhance a Custom provider prompt locally, or keep the original."""
+        if self._get_provider() != "custom" or custom_provider is None:
+            return prompt
+        settings = custom_provider.resolve_enhancement_settings(self.config)
+        if not settings["enabled"]:
+            return prompt
+        self._update_progress(progress_label, "Enhancing prompt locally...")
+
+        def operation():
+            data = custom_provider.enhance_or_original(
+                self.config, prompt, opener=self._make_url_request
+            )
+            return {"success": True, "message": data[2], "data": data}
+
+        success, message, data = self._run_threaded_operation(
+            operation,
+            "Custom prompt enhancement",
+            progress_label,
+            max_wait_time=settings["timeout"],
+        )
+        if success and data and data[1]:
+            self._update_progress(progress_label, "Prompt enhanced locally")
+            return data[0]
+        detail = data[2] if data else message
+        self._update_progress(
+            progress_label,
+            f"Prompt enhancement failed; using original prompt ({detail})",
+        )
+        return prompt
+
+    def _get_deepseek_image_settings(self):
+        """Base URL and model for DeepSeek's OpenAI-compatible image endpoints"""
+        section = self.config.get("deepseek", {})
+        base_url = (
+            section.get("image_base_url") or "https://api.deepseek.com/v1"
+        ).rstrip("/")
+        model = section.get("image_model") or section.get("model") or "deepseek-flash"
+        return base_url, model
+
+    def _deepseek_image_endpoint_is_official(self):
+        """
+        True when the image base URL points at DeepSeek's own API.
+
+        That API has no /images endpoints - a request there returns 404. The
+        provider entry is still useful for a compatible gateway, so this only
+        drives warnings and a clearer error message.
+        """
+        base_url, _ = self._get_deepseek_image_settings()
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+        return host == "api.deepseek.com" or host.endswith(".api.deepseek.com")
+
+    def _deepseek_generation_size(self, width, height, exact=False):
+        """Free-size shape string for the DeepSeek image endpoint"""
+        max_pixels = GPT_IMAGE_LIMIT_PIXELS if exact else GPT_IMAGE_MAX_PIXELS
+        target_w, target_h = get_gpt_image_shape(width, height, max_pixels)
+        return f"{target_w}x{target_h}"
 
     def _log_bedrock_environment(self):
         """Print what the plugin can actually see, for diagnosing credential problems"""
@@ -955,14 +1231,26 @@ class GimpAIPlugin(Gimp.PlugIn):
 
     def _add_api_warning_bar(self, content_area, dialog, provider="openai"):
         """Add API key warning info bar if needed, returns (warning_bar, ok_button_needs_config)"""
-        if self._credentials_ready(provider):
+        deepseek_official = (
+            provider == "deepseek" and self._deepseek_image_endpoint_is_official()
+        )
+        if not deepseek_official and self._credentials_ready(provider):
             return None, False
 
-        warning_text = (
-            "⚠️ AWS credentials for Bedrock not configured"
-            if provider == "bedrock"
-            else "⚠️ OpenAI API key not configured"
-        )
+        if deepseek_official:
+            warning_text = (
+                "⚠️ DeepSeek's public API has no image endpoint. Set a "
+                "compatible image base URL in Settings, or switch to OpenAI "
+                "or Amazon Bedrock for images."
+            )
+        elif provider == "bedrock":
+            warning_text = "⚠️ AWS credentials for Bedrock not configured"
+        elif provider == "deepseek":
+            warning_text = "⚠️ DeepSeek API key not configured"
+        elif provider == "custom":
+            warning_text = "⚠️ Custom provider base URL or settings are invalid (API key may be blank)"
+        else:
+            warning_text = "⚠️ OpenAI API key not configured"
 
         # Create warning info bar
         api_warning_bar = Gtk.InfoBar()
@@ -973,6 +1261,8 @@ class GimpAIPlugin(Gimp.PlugIn):
         warning_label = Gtk.Label()
         warning_label.set_markup(warning_text)
         warning_label.set_halign(Gtk.Align.START)
+        warning_label.set_line_wrap(True)
+        warning_label.set_max_width_chars(70)
 
         # Configure button - connect to main dialog response
         configure_button = api_warning_bar.add_button(
@@ -992,7 +1282,9 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         content_area.pack_start(api_warning_bar, False, False, 5)
 
-        return api_warning_bar, True
+        # The official DeepSeek URL is a warning, not a missing credential:
+        # keep OK enabled so the user can still choose another provider.
+        return api_warning_bar, not deepseek_official
 
     def _model_info_rows(self, operation, variant=None):
         """
@@ -1001,7 +1293,50 @@ class GimpAIPlugin(Gimp.PlugIn):
         Read from config the same way the API calls read it, so the box shows
         what is actually sent.
         """
-        if self._get_provider() != "bedrock":
+        provider = self._get_provider()
+        if provider == "custom":
+            cfg = self.config.get("custom", {})
+            params = ["1 image", "no OpenAI-only fields"]
+            if operation == "erase":
+                params.append("fixed removal prompt")
+            if cfg.get("extra_parameters"):
+                params.append("custom extra parameters")
+            enhancement = self.config.get("prompt_enhancement", {})
+            if enhancement.get("enabled") and operation != "erase":
+                params.append("local prompt enhancement")
+            return [
+                ("Provider", "Custom (OpenAI-compatible)"),
+                ("Endpoint", cfg.get("base_url") or "not configured"),
+                ("Parameters", ", ".join(params)),
+            ]
+        if provider == "deepseek":
+            base_url, model = self._get_deepseek_image_settings()
+            endpoint = base_url
+            if self._deepseek_image_endpoint_is_official():
+                endpoint += " (official - no image API)"
+            ds_cfg = self.config.get("deepseek", {})
+            params = ["quality high", "1 image"]
+            if operation == "erase":
+                count = max(1, min(4, int(ds_cfg.get("erase_variations", 1))))
+                grow = max(0, min(50, int(ds_cfg.get("erase_grow_mask", 8))))
+                params = [
+                    "quality high",
+                    "1 image" if count == 1 else f"{count} variations",
+                    f"selection grown {grow}px",
+                    "fixed removal prompt",
+                ]
+            if operation in ("inpaint", "composite", "erase"):
+                params += ["moderation low", "high fidelity (built in)"]
+            if operation != "erase" and self._auto_enhance_enabled():
+                params.append("prompt refined by DeepSeek")
+            return [
+                ("Provider", "DeepSeek"),
+                ("Model", model),
+                ("Endpoint", endpoint),
+                ("Parameters", ", ".join(params)),
+            ]
+
+        if provider != "bedrock":
             model = self._get_openai_model()
             labels = dict(OPENAI_IMAGE_MODELS)
             params = ["quality high", "1 image"]
@@ -1197,6 +1532,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 default_text = "Describe the area to inpaint (e.g. 'remove object', 'fix background')"
             else:
                 default_text = "Describe what you want to generate..."
+        placeholder_texts = [
+            "Describe what you want to generate...",
+            "Describe the area to inpaint (e.g. 'remove object', 'fix background')",
+        ]
         try:
             # Create dialog using helper methods
             dialog = self._create_dialog_base(title, (600, 300))
@@ -1222,6 +1561,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # Disable OK button when no API key
                 ok_button.set_sensitive(False)
                 ok_button.set_label("Configure & Continue")
+            self._set_operation_availability(ok_button, provider, operation)
 
             # Sections are numbered in the order they appear
             section_number = [0]
@@ -1230,12 +1570,13 @@ class GimpAIPlugin(Gimp.PlugIn):
                 section_number[0] += 1
                 return f"{section_number[0]}. {text}"
 
+            enhance_button = self._create_enhance_button()
             prompt_box = self._add_section(
                 content_area, numbered("Prompt"),
                 "Describe the change you want in the selected area."
                 if operation == "inpaint"
                 else "Describe the image you want to generate.",
-                icon="prompt", separator=False,
+                icon="prompt", separator=False, header_widget=enhance_button,
             )
 
             # Prompt history dropdown
@@ -1385,7 +1726,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # sent) go first and count towards the API's input image limit
                 reserved = 0
                 if operation == "inpaint":
-                    reserved = 2 if self._openai_mask_hint() else 1
+                    reserved = 2 if self._provider_mask_hint(provider) else 1
                 reference_combos = self._add_reference_pickers(
                     content_area, image, numbered("Reference Images"),
                     max_slots=OPENAI_MAX_INPUT_IMAGES - reserved,
@@ -1431,6 +1772,46 @@ class GimpAIPlugin(Gimp.PlugIn):
             progress_frame, progress_label = self._create_progress_widget()
             status_box.pack_start(progress_frame, False, False, 0)
 
+            # True once the current text came back from DeepSeek, so automatic
+            # refinement does not rewrite an already refined prompt
+            enhanced = [False]
+
+            def on_enhance_clicked(_button):
+                current = text_buffer.get_text(
+                    text_buffer.get_start_iter(), text_buffer.get_end_iter(), False
+                ).strip()
+                if not current or current in placeholder_texts:
+                    self._update_progress(
+                        progress_label, "❌ Enter a prompt first, then enhance it"
+                    )
+                    return
+
+                enhance_button.set_sensitive(False)
+                enhance_button.set_label("Refining...")
+                self._flush_ui()
+                try:
+                    success, message, refined = self._refine_prompt_with_deepseek(
+                        current, operation, progress_label
+                    )
+                    if success and refined:
+                        text_buffer.set_text(refined)
+                        text_buffer.select_range(
+                            text_buffer.get_start_iter(), text_buffer.get_end_iter()
+                        )
+                        enhanced[0] = True
+                        self._update_progress(
+                            progress_label,
+                            "✅ Prompt refined with DeepSeek - review it before continuing",
+                        )
+                    else:
+                        self._update_progress(progress_label, f"❌ {message}")
+                finally:
+                    enhance_button.set_label("Enhance with DeepSeek")
+                    enhance_button.set_sensitive(self._deepseek_ready())
+                    self._flush_ui()
+
+            enhance_button.connect("clicked", on_enhance_clicked)
+
             # Show all widgets
             content_area.show_all()
 
@@ -1468,6 +1849,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                             # The settings dialog can change the provider itself
                             provider = self._get_provider()
                             refresh_model_info()
+                            self._refresh_enhance_button(enhance_button)
 
                             # Re-check credentials after settings dialog
                             if self._credentials_ready(provider):
@@ -1481,17 +1863,17 @@ class GimpAIPlugin(Gimp.PlugIn):
                                 print(f"DEBUG: {provider} still not configured")
                                 continue  # Keep dialog open
 
+                        if not self._set_operation_availability(
+                            ok_button, provider, operation
+                        ):
+                            continue
+
                         # Now validate the prompt
                         start_iter = text_buffer.get_start_iter()
                         end_iter = text_buffer.get_end_iter()
                         prompt = text_buffer.get_text(start_iter, end_iter, False).strip()
 
                         # Check if user entered actual content (not just placeholder)
-                        placeholder_texts = [
-                            "Describe what you want to generate...",
-                            "Describe the area to inpaint (e.g. 'remove object', 'fix background')",
-                        ]
-
                         is_placeholder = prompt in placeholder_texts or not prompt.strip()
 
                         if is_placeholder:
@@ -1532,6 +1914,15 @@ class GimpAIPlugin(Gimp.PlugIn):
                         # Update progress
                         self._update_progress(progress_label, "Validating API key...")
 
+                        # Optional automatic DeepSeek rewrite. The user may
+                        # have already pressed Enhance, in which case leave
+                        # their edited text alone.
+                        if not enhanced[0]:
+                            prompt = self._maybe_refine_prompt(
+                                prompt, operation, progress_label
+                            )
+                            text_buffer.set_text(prompt)
+
                         if size_combo:
                             self._dialog_size = (
                                 int(width_spin.get_value()),
@@ -1567,6 +1958,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         # Re-check credentials after settings dialog
                         provider = self._get_provider()
                         refresh_model_info()
+                        self._refresh_enhance_button(enhance_button)
                         if self._credentials_ready(provider):
                             # Credentials now configured - update UI
                             if api_warning_bar:
@@ -1582,6 +1974,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         self._show_settings_dialog(dialog)
                         provider = self._get_provider()
                         refresh_model_info()
+                        self._refresh_enhance_button(enhance_button)
                         # Continue loop to keep main dialog open
                     else:
                         print("DEBUG: Dialog cancelled, destroying...")
@@ -1593,6 +1986,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             def retry_dialog():
                 ok_button.set_sensitive(True)
                 ok_button.set_label("OK")
+                self._set_operation_availability(ok_button, provider, operation)
                 text_view.grab_focus()
                 return wait_for_prompt()
 
@@ -1659,6 +2053,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                 # Disable OK button when no API key
                 ok_button.set_sensitive(False)
                 ok_button.set_label("Configure & Continue")
+            self._set_operation_availability(ok_button, provider, "composite")
 
             # Layer list (read-only, just for user info)
             layer_box = self._add_section(
@@ -1681,10 +2076,11 @@ class GimpAIPlugin(Gimp.PlugIn):
                 layer_label.set_halign(Gtk.Align.START)
                 layer_box.pack_start(layer_label, False, False, 0)
 
+            enhance_button = self._create_enhance_button()
             prompt_box = self._add_section(
                 content_area, "2. Prompt",
                 "Describe how to combine these layers.",
-                icon="prompt",
+                icon="prompt", header_widget=enhance_button,
             )
 
             # Prompt history dropdown
@@ -1762,6 +2158,48 @@ class GimpAIPlugin(Gimp.PlugIn):
             progress_frame, progress_label = self._create_progress_widget()
             status_box.pack_start(progress_frame, False, False, 0)
 
+            composite_placeholders = [
+                "Combine these layers naturally into a cohesive image",
+                "Describe what you want to generate...",
+            ]
+            enhanced = [False]
+
+            def on_enhance_clicked(_button):
+                current = text_buffer.get_text(
+                    text_buffer.get_start_iter(), text_buffer.get_end_iter(), False
+                ).strip()
+                if not current or current in composite_placeholders:
+                    self._update_progress(
+                        progress_label, "❌ Enter a prompt first, then enhance it"
+                    )
+                    return
+
+                enhance_button.set_sensitive(False)
+                enhance_button.set_label("Refining...")
+                self._flush_ui()
+                try:
+                    success, message, refined = self._refine_prompt_with_deepseek(
+                        current, "composite", progress_label
+                    )
+                    if success and refined:
+                        text_buffer.set_text(refined)
+                        text_buffer.select_range(
+                            text_buffer.get_start_iter(), text_buffer.get_end_iter()
+                        )
+                        enhanced[0] = True
+                        self._update_progress(
+                            progress_label,
+                            "✅ Prompt refined with DeepSeek - review it before continuing",
+                        )
+                    else:
+                        self._update_progress(progress_label, f"❌ {message}")
+                finally:
+                    enhance_button.set_label("Enhance with DeepSeek")
+                    enhance_button.set_sensitive(self._deepseek_ready())
+                    self._flush_ui()
+
+            enhance_button.connect("clicked", on_enhance_clicked)
+
             # Show dialog
             content_area.show_all()
             text_view.grab_focus()
@@ -1783,18 +2221,19 @@ class GimpAIPlugin(Gimp.PlugIn):
                     response = dialog.run()
 
                     if response == Gtk.ResponseType.OK:
+                        if not self._set_operation_availability(
+                            ok_button, provider, "composite"
+                        ):
+                            continue
                         # Get prompt text
                         start_iter = text_buffer.get_start_iter()
                         end_iter = text_buffer.get_end_iter()
                         prompt = text_buffer.get_text(start_iter, end_iter, False)
 
                         # Check if user entered actual content (not just placeholder)
-                        placeholder_texts = [
-                            "Combine these layers naturally into a cohesive image",
-                            "Describe what you want to generate...",
-                        ]
-
-                        is_placeholder = prompt in placeholder_texts or not prompt.strip()
+                        is_placeholder = (
+                            prompt in composite_placeholders or not prompt.strip()
+                        )
 
                         if is_placeholder:
                             # Show error
@@ -1825,6 +2264,14 @@ class GimpAIPlugin(Gimp.PlugIn):
                         # Update progress
                         self._update_progress(progress_label, "Validating API key...")
 
+                        # Optional automatic DeepSeek rewrite, unless the user
+                        # already refined this text with the button
+                        if not enhanced[0]:
+                            prompt = self._maybe_refine_prompt(
+                                prompt.strip(), "composite", progress_label
+                            )
+                            text_buffer.set_text(prompt)
+
                         # Save prompt to history
                         self._add_to_prompt_history(prompt.strip())
 
@@ -1847,6 +2294,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         # Check if credentials were configured
                         provider = self._get_provider()
                         refresh_model_info()
+                        self._refresh_enhance_button(enhance_button)
                         if self._credentials_ready(provider):
                             print(f"DEBUG: {provider} configured, enabled OK button")
                             ok_button.set_sensitive(True)
@@ -1863,6 +2311,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         # Check if credentials were configured
                         provider = self._get_provider()
                         refresh_model_info()
+                        self._refresh_enhance_button(enhance_button)
                         if self._credentials_ready(provider):
                             print(f"DEBUG: {provider} configured, enabled OK button")
                             ok_button.set_sensitive(True)
@@ -1881,6 +2330,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             def retry_dialog():
                 ok_button.set_sensitive(True)
                 ok_button.set_label("Composite Layers")
+                self._set_operation_availability(ok_button, provider, "composite")
                 text_view.grab_focus()
                 return wait_for_prompt()
 
@@ -1945,9 +2395,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             )
 
             provider_combo = Gtk.ComboBoxText()
-            provider_ids = ["openai", "bedrock"]
+            provider_ids = ["openai", "bedrock", "deepseek", "custom"]
             provider_combo.append_text("OpenAI (GPT-Image)")
             provider_combo.append_text("Amazon Bedrock (Stability inpainting)")
+            provider_combo.append_text("DeepSeek (OpenAI-compatible images)")
+            provider_combo.append_text("Custom (OpenAI-compatible)")
             current_provider = self.config.get("api_provider", "openai")
             provider_combo.set_active(
                 provider_ids.index(current_provider)
@@ -1957,16 +2409,42 @@ class GimpAIPlugin(Gimp.PlugIn):
             provider_box.pack_start(provider_combo, False, False, 0)
 
             provider_info = Gtk.Label()
-            provider_info.set_text(
-                "Image generation and layer composite always use OpenAI"
-            )
             provider_info.set_halign(Gtk.Align.START)
+            provider_info.set_line_wrap(True)
+            provider_info.set_max_width_chars(46)
+            provider_info.set_xalign(0.0)
             provider_info.get_style_context().add_class("dim-label")
             provider_box.pack_start(provider_info, False, False, 0)
 
+            provider_hints = {
+                "openai": "Inpainting, erase, composite and generation use OpenAI GPT-Image.",
+                "bedrock": "Inpainting, erase and composite use Stability on Amazon Bedrock; upscale is Bedrock-only.",
+                "deepseek": (
+                    "DeepSeek's public API has no image endpoint yet. This uses the "
+                    "OpenAI-compatible image URL in the DeepSeek section below, so "
+                    "choose OpenAI or Bedrock unless you run a compatible gateway."
+                ),
+                "custom": (
+                    "Text-to-image, inpainting and erase use your OpenAI-compatible "
+                    "server. Upscale and composite are off by default; an API key is optional."
+                ),
+            }
+
+            def on_provider_changed(combo):
+                active = combo.get_active()
+                provider_info.set_text(
+                    provider_hints.get(provider_ids[active], "")
+                    if active >= 0
+                    else ""
+                )
+
+            provider_combo.connect("changed", on_provider_changed)
+            on_provider_changed(provider_combo)
+
             if bedrock_client is None:
-                provider_combo.set_sensitive(False)
                 provider_info.set_text("bedrock_client.py is missing - reinstall the plugin")
+            if deepseek_client is None:
+                provider_info.set_text("deepseek_client.py is missing - reinstall the plugin")
 
             # API Key section
             api_box = self._add_section(
@@ -2009,6 +2487,309 @@ class GimpAIPlugin(Gimp.PlugIn):
                 openai_model_combo.append_text(current_model)
             openai_model_combo.set_active(openai_model_ids.index(current_model))
             api_box.pack_start(openai_model_combo, False, False, 0)
+
+            # DeepSeek: prompt rewriting plus an OpenAI-compatible image
+            # endpoint for the provider entry in the dropdown above.
+            deepseek_config = self.config.get("deepseek", {})
+            deepseek_box = self._add_section(
+                content_area, "DeepSeek",
+                "Image endpoint, prompt model and API key.",
+                icon="deepseek",
+            )
+
+            ds_key_entry = None
+            ds_model_combo = None
+            ds_base_entry = None
+            ds_image_model_entry = None
+            ds_image_base_entry = None
+            ds_auto_check = None
+            ds_model_ids = []
+
+            if deepseek_client is None:
+                ds_missing = Gtk.Label(
+                    label="deepseek_client.py is missing - reinstall the plugin"
+                )
+                ds_missing.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_missing, False, False, 0)
+            else:
+                ds_settings = deepseek_client.resolve_settings(self.config)
+                if ds_settings["api_key"]:
+                    source = (
+                        "config"
+                        if deepseek_config.get("api_key")
+                        else "DEEPSEEK_API_KEY environment variable"
+                    )
+                    ds_status = Gtk.Label(
+                        label=f"✓ DeepSeek API key is configured ({source})"
+                    )
+                else:
+                    ds_status = Gtk.Label(label="✗ No DeepSeek API key configured")
+                ds_status.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_status, False, False, 0)
+
+                ds_key_label = Gtk.Label(label="API key (write-only):")
+                ds_key_label.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_key_label, False, False, 0)
+
+                ds_key_entry = Gtk.Entry()
+                ds_key_entry.set_visibility(False)
+                ds_key_entry.set_placeholder_text(
+                    "stored - type to replace"
+                    if deepseek_config.get("api_key")
+                    else "sk-... or set DEEPSEEK_API_KEY"
+                )
+                deepseek_box.pack_start(ds_key_entry, False, False, 0)
+
+                ds_model_label = Gtk.Label(label="Prompt model:")
+                ds_model_label.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_model_label, False, False, 0)
+
+                ds_model_ids = [model_id for model_id, _ in deepseek_client.DEEPSEEK_MODELS]
+                ds_model_combo = Gtk.ComboBoxText()
+                for _, label in deepseek_client.DEEPSEEK_MODELS:
+                    ds_model_combo.append_text(label)
+                ds_current_model = ds_settings["model"]
+                if ds_current_model not in ds_model_ids:
+                    # Keep a hand-edited model id selectable
+                    ds_model_ids.append(ds_current_model)
+                    ds_model_combo.append_text(ds_current_model)
+                ds_model_combo.set_active(ds_model_ids.index(ds_current_model))
+                deepseek_box.pack_start(ds_model_combo, False, False, 0)
+
+                ds_base_label = Gtk.Label(label="API base URL (blank for default):")
+                ds_base_label.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_base_label, False, False, 0)
+
+                ds_base_entry = Gtk.Entry()
+                ds_base_entry.set_placeholder_text(deepseek_client.DEFAULT_BASE_URL)
+                ds_base_entry.set_text(deepseek_config.get("base_url", ""))
+                deepseek_box.pack_start(ds_base_entry, False, False, 0)
+
+                ds_image_model_label = Gtk.Label(
+                    label="Image model (only when DeepSeek is the provider):"
+                )
+                ds_image_model_label.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_image_model_label, False, False, 0)
+
+                ds_image_model_entry = Gtk.Entry()
+                ds_image_model_entry.set_placeholder_text(
+                    deepseek_config.get("model", deepseek_client.DEFAULT_MODEL)
+                )
+                ds_image_model_entry.set_text(
+                    deepseek_config.get("image_model", "")
+                )
+                deepseek_box.pack_start(ds_image_model_entry, False, False, 0)
+
+                ds_image_base_label = Gtk.Label(
+                    label="Image API base URL (blank for deepseek.com/v1):"
+                )
+                ds_image_base_label.set_halign(Gtk.Align.START)
+                deepseek_box.pack_start(ds_image_base_label, False, False, 0)
+
+                ds_image_base_entry = Gtk.Entry()
+                ds_image_base_entry.set_placeholder_text(
+                    "https://api.deepseek.com/v1"
+                )
+                ds_image_base_entry.set_text(
+                    deepseek_config.get("image_base_url", "")
+                )
+                deepseek_box.pack_start(ds_image_base_entry, False, False, 0)
+
+                ds_auto_check = Gtk.CheckButton()
+                ds_auto_check.set_label("Refine prompts automatically before generating")
+                ds_auto_check.set_active(bool(deepseek_config.get("auto_enhance", False)))
+                deepseek_box.pack_start(ds_auto_check, False, False, 0)
+
+                ds_info = Gtk.Label()
+                ds_info.set_text(
+                    "DeepSeek's official API only serves text and vision, so prompt "
+                    "refinement works out of the box. The provider entry above talks "
+                    "to an OpenAI-compatible image API; point the image URL at a "
+                    "gateway that offers one, or keep OpenAI/Bedrock for images."
+                )
+                ds_info.set_line_wrap(True)
+                ds_info.set_max_width_chars(46)
+                ds_info.set_xalign(0.0)
+                ds_info.set_halign(Gtk.Align.START)
+                ds_info.get_style_context().add_class("dim-label")
+                deepseek_box.pack_start(ds_info, False, False, 0)
+
+            custom_config = self.config.get("custom", {})
+            custom_box = self._add_section(
+                right_column, "Custom (OpenAI-compatible)",
+                "Local or LAN image server; API key is optional.",
+                icon="provider",
+            )
+            custom_grid = Gtk.Grid()
+            custom_grid.set_row_spacing(6)
+            custom_grid.set_column_spacing(10)
+
+            def add_custom_row(row, text, entry):
+                label = Gtk.Label(label=text)
+                label.set_halign(Gtk.Align.START)
+                entry.set_hexpand(True)
+                custom_grid.attach(label, 0, row, 1, 1)
+                custom_grid.attach(entry, 1, row, 1, 1)
+
+            custom_base_entry = Gtk.Entry()
+            custom_base_entry.set_placeholder_text("http://192.168.1.50:8080")
+            custom_base_entry.set_text(custom_config.get("base_url", ""))
+            add_custom_row(0, "Base URL:", custom_base_entry)
+
+            custom_key_entry = Gtk.Entry()
+            custom_key_entry.set_visibility(False)
+            custom_key_entry.set_placeholder_text(
+                "stored - type to replace" if custom_config.get("api_key")
+                else "optional - blank allowed"
+            )
+            add_custom_row(1, "API key:", custom_key_entry)
+
+            custom_timeout_spin = Gtk.SpinButton.new_with_range(30, 3600, 30)
+            custom_timeout_spin.set_value(custom_config.get("timeout", 600))
+            add_custom_row(2, "Timeout seconds:", custom_timeout_spin)
+
+            custom_extra_entry = Gtk.Entry()
+            custom_extra_entry.set_placeholder_text('{"steps": 20, "cfg_scale": 7}')
+            extra = custom_config.get("extra_parameters", "")
+            custom_extra_entry.set_text(
+                json.dumps(extra) if isinstance(extra, dict) else str(extra or "")
+            )
+            add_custom_row(3, "Extra parameters (JSON):", custom_extra_entry)
+            custom_box.pack_start(custom_grid, False, False, 0)
+
+            custom_key_cleared = [False]
+            custom_clear_button = Gtk.Button(label="Clear Custom API Key")
+            custom_box.pack_start(custom_clear_button, False, False, 0)
+
+            custom_status_label = Gtk.Label()
+            custom_status_label.set_line_wrap(True)
+            custom_status_label.set_max_width_chars(46)
+            custom_status_label.set_xalign(0.0)
+            custom_status_label.set_halign(Gtk.Align.START)
+            custom_box.pack_start(custom_status_label, False, False, 0)
+            custom_test_button = Gtk.Button(label="Test")
+            custom_box.pack_start(custom_test_button, False, False, 0)
+
+            enhancement_config = self.config.get("prompt_enhancement", {})
+            enhancement_box = self._add_section(
+                content_area, "Prompt enhancement",
+                "Optional local LLM, used only with the Custom provider.",
+                icon="deepseek",
+            )
+            enhancement_enabled_check = Gtk.CheckButton()
+            enhancement_enabled_check.set_label("Enhance prompts before image requests")
+            enhancement_enabled_check.set_active(
+                bool(enhancement_config.get("enabled", False))
+            )
+            enhancement_box.pack_start(enhancement_enabled_check, False, False, 0)
+
+            enhancement_grid = Gtk.Grid()
+            enhancement_grid.set_row_spacing(6)
+            enhancement_grid.set_column_spacing(10)
+
+            def add_enhancement_row(row, text, entry):
+                label = Gtk.Label(label=text)
+                label.set_halign(Gtk.Align.START)
+                entry.set_hexpand(True)
+                enhancement_grid.attach(label, 0, row, 1, 1)
+                enhancement_grid.attach(entry, 1, row, 1, 1)
+
+            enhancement_endpoint_entry = Gtk.Entry()
+            enhancement_endpoint_entry.set_placeholder_text(
+                "http://localhost:5001/v1/chat/completions"
+            )
+            enhancement_endpoint_entry.set_text(enhancement_config.get("endpoint", ""))
+            add_enhancement_row(0, "Endpoint:", enhancement_endpoint_entry)
+
+            enhancement_model_entry = Gtk.Entry()
+            enhancement_model_entry.set_placeholder_text("local-model")
+            enhancement_model_entry.set_text(enhancement_config.get("model", ""))
+            add_enhancement_row(1, "Model name:", enhancement_model_entry)
+
+            enhancement_key_entry = Gtk.Entry()
+            enhancement_key_entry.set_visibility(False)
+            enhancement_key_entry.set_placeholder_text(
+                "stored - type to replace" if enhancement_config.get("api_key")
+                else "optional - blank allowed"
+            )
+            add_enhancement_row(2, "API key:", enhancement_key_entry)
+
+            enhancement_timeout_spin = Gtk.SpinButton.new_with_range(30, 3600, 30)
+            enhancement_timeout_spin.set_value(enhancement_config.get("timeout", 120))
+            add_enhancement_row(3, "Timeout seconds:", enhancement_timeout_spin)
+            enhancement_box.pack_start(enhancement_grid, False, False, 0)
+
+            enhancement_key_cleared = [False]
+            enhancement_clear_button = Gtk.Button(label="Clear Enhancement API Key")
+            enhancement_box.pack_start(enhancement_clear_button, False, False, 0)
+
+            def custom_config_from_fields():
+                candidate = dict(self.config)
+                section = dict(custom_config)
+                section.update({
+                    "base_url": custom_base_entry.get_text().strip(),
+                    "timeout": custom_timeout_spin.get_value_as_int(),
+                    "extra_parameters": custom_extra_entry.get_text().strip(),
+                })
+                new_key = custom_key_entry.get_text().strip()
+                if custom_key_cleared[0]:
+                    section["api_key"] = ""
+                elif new_key:
+                    section["api_key"] = new_key
+                candidate["custom"] = section
+                return candidate
+
+            def on_custom_clear_clicked(_button):
+                custom_key_entry.set_text("")
+                custom_key_cleared[0] = True
+                custom_key_entry.set_placeholder_text("cleared - blank allowed")
+
+            def on_enhancement_clear_clicked(_button):
+                enhancement_key_entry.set_text("")
+                enhancement_key_cleared[0] = True
+                enhancement_key_entry.set_placeholder_text("cleared - blank allowed")
+
+            def on_custom_test_clicked(button):
+                if custom_provider is None:
+                    custom_status_label.set_text("custom_provider.py is missing")
+                    return
+                candidate = custom_config_from_fields()
+                try:
+                    settings = custom_provider.resolve_settings(candidate)
+                except custom_provider.CustomProviderError as e:
+                    custom_status_label.set_text(str(e))
+                    return
+                button.set_sensitive(False)
+                button.set_label("Testing...")
+                custom_status_label.set_text(
+                    "Testing generation; slow hardware may take several minutes..."
+                )
+                self._cancel_requested = False
+
+                def operation():
+                    report = custom_provider.test_connection(
+                        candidate, opener=self._make_url_request
+                    )
+                    return {
+                        "success": True,
+                        "message": report["message"],
+                        "data": report,
+                    }
+
+                _, message, report = self._run_threaded_operation(
+                    operation,
+                    "Custom provider connection test",
+                    max_wait_time=settings["timeout"] * 2 + 45,
+                )
+                custom_status_label.set_text(
+                    report["message"] if report else message
+                )
+                button.set_label("Test")
+                button.set_sensitive(True)
+
+            custom_clear_button.connect("clicked", on_custom_clear_clicked)
+            enhancement_clear_button.connect("clicked", on_enhancement_clear_clicked)
+            custom_test_button.connect("clicked", on_custom_test_clicked)
 
             # Bedrock section
             bedrock_config = self.config.get("bedrock", {})
@@ -2133,6 +2914,49 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Run dialog
             response = dialog.run()
+            while response == Gtk.ResponseType.OK:
+                custom_values = custom_config_from_fields()["custom"]
+                enhancement_values = dict(enhancement_config)
+                enhancement_values.update({
+                    "enabled": enhancement_enabled_check.get_active(),
+                    "endpoint": enhancement_endpoint_entry.get_text().strip(),
+                    "model": enhancement_model_entry.get_text().strip(),
+                    "timeout": enhancement_timeout_spin.get_value_as_int(),
+                })
+                new_enhancement_key = enhancement_key_entry.get_text().strip()
+                if enhancement_key_cleared[0]:
+                    enhancement_values["api_key"] = ""
+                elif new_enhancement_key:
+                    enhancement_values["api_key"] = new_enhancement_key
+                try:
+                    if custom_provider is not None:
+                        candidate = dict(self.config)
+                        candidate["custom"] = custom_values
+                        candidate["prompt_enhancement"] = enhancement_values
+                        settings = custom_provider.resolve_settings(candidate)
+                        custom_provider.parse_extra_parameters(
+                            settings["extra_parameters"]
+                        )
+                        custom_values["base_url"] = settings["base_url"]
+                        if enhancement_values["enabled"]:
+                            custom_provider.build_chat_request(candidate, "validation")
+                        enhancement_values["endpoint"] = (
+                            custom_provider.resolve_enhancement_settings(candidate)["endpoint"]
+                        )
+                except custom_provider.CustomProviderError as e:
+                    error_dialog = Gtk.MessageDialog(
+                        parent=dialog,
+                        flags=Gtk.DialogFlags.MODAL,
+                        message_type=Gtk.MessageType.WARNING,
+                        buttons=Gtk.ButtonsType.OK,
+                        text="Invalid Custom provider settings",
+                    )
+                    error_dialog.format_secondary_text(str(e))
+                    error_dialog.run()
+                    error_dialog.destroy()
+                    response = dialog.run()
+                    continue
+                break
             if response == Gtk.ResponseType.OK:
                 # Save new API key if provided
                 new_key = key_entry.get_text().strip()
@@ -2149,6 +2973,48 @@ class GimpAIPlugin(Gimp.PlugIn):
                         active_model
                     ]
                     print(f"DEBUG: OpenAI model set to {openai_model_ids[active_model]}")
+
+                # Save DeepSeek prompt assistant settings. A blank key keeps
+                # the stored one, like the other secret fields.
+                if ds_key_entry is not None:
+                    deepseek = self.config.setdefault("deepseek", {})
+                    new_ds_key = ds_key_entry.get_text().strip()
+                    if new_ds_key:
+                        deepseek["api_key"] = new_ds_key
+                        print("DEBUG: DeepSeek API key updated")
+
+                    if ds_model_combo is not None and ds_model_combo.get_active() >= 0:
+                        deepseek["model"] = ds_model_ids[ds_model_combo.get_active()]
+                        print(f"DEBUG: DeepSeek model set to {deepseek['model']}")
+
+                    base_url = ds_base_entry.get_text().strip().rstrip("/")
+                    if base_url:
+                        deepseek["base_url"] = base_url
+                    else:
+                        deepseek.pop("base_url", None)
+
+                    image_model = ds_image_model_entry.get_text().strip()
+                    if image_model:
+                        deepseek["image_model"] = image_model
+                    else:
+                        deepseek.pop("image_model", None)
+
+                    image_base_url = (
+                        ds_image_base_entry.get_text().strip().rstrip("/")
+                    )
+                    if image_base_url:
+                        deepseek["image_base_url"] = image_base_url
+                    else:
+                        deepseek.pop("image_base_url", None)
+
+                    deepseek["auto_enhance"] = bool(ds_auto_check.get_active())
+                    print(
+                        "DEBUG: DeepSeek automatic prompt refinement set to "
+                        f"{deepseek['auto_enhance']}"
+                    )
+
+                self.config["custom"] = custom_values
+                self.config["prompt_enhancement"] = enhancement_values
 
                 # Save provider selection
                 active = provider_combo.get_active()
@@ -2406,7 +3272,12 @@ class GimpAIPlugin(Gimp.PlugIn):
                 f"DEBUG: Full image bounds: ({full_x1},{full_y1}) to ({full_x2},{full_y2})"
             )
 
-            if any_size:
+            if self._get_provider() == "custom":
+                target_shape = (
+                    max(64, int(round(orig_width / 8.0)) * 8),
+                    max(64, int(round(orig_height / 8.0)) * 8),
+                )
+            elif any_size:
                 target_shape = get_gpt_image_shape(orig_width, orig_height)
             else:
                 target_shape = get_optimal_openai_shape(orig_width, orig_height)
@@ -2791,6 +3662,9 @@ class GimpAIPlugin(Gimp.PlugIn):
             if needs_config:
                 ok_button.set_sensitive(False)
                 ok_button.set_label("Configure & Continue")
+            provider = self._get_provider()
+            if provider == "custom":
+                self._set_operation_availability(ok_button, provider, "upscale")
 
             method_box = self._add_section(
                 content_area, "1. Method",
@@ -2806,9 +3680,16 @@ class GimpAIPlugin(Gimp.PlugIn):
             last = self.config.get("bedrock", {}).get("upscale_variant", "conservative")
             combo.set_active(variants.index(last) if last in variants else 1)
             method_box.pack_start(combo, False, False, 0)
+            if provider == "custom":
+                combo.set_sensitive(False)
+                combo.set_tooltip_text(
+                    "Bedrock methods do not apply; Custom uses an experimental 4x edits request"
+                )
 
             info = Gtk.Label()
             info.set_text(
+                "Custom sends a 4x image-to-image request when its upscale capability is enabled."
+                if provider == "custom" else
                 "Fast only accepts layers up to 1536px per side; larger layers "
                 "are reduced to fit before upscaling."
             )
@@ -2818,10 +3699,11 @@ class GimpAIPlugin(Gimp.PlugIn):
             info.get_style_context().add_class("dim-label")
             method_box.pack_start(info, False, False, 0)
 
+            enhance_button = self._create_enhance_button()
             prompt_box = self._add_section(
                 content_area, "2. Prompt",
                 "Describe the image (used by Conservative and Creative).",
-                icon="prompt",
+                icon="prompt", header_widget=enhance_button,
             )
 
             prompt_entry = Gtk.Entry()
@@ -2841,6 +3723,39 @@ class GimpAIPlugin(Gimp.PlugIn):
             progress_frame, progress_label = self._create_progress_widget()
             status_box.pack_start(progress_frame, False, False, 0)
 
+            enhanced = [False]
+
+            def on_enhance_clicked(_button):
+                current = prompt_entry.get_text().strip()
+                if not current:
+                    self._update_progress(
+                        progress_label, "❌ Enter a prompt first, then enhance it"
+                    )
+                    return
+
+                enhance_button.set_sensitive(False)
+                enhance_button.set_label("Refining...")
+                self._flush_ui()
+                try:
+                    success, message, refined = self._refine_prompt_with_deepseek(
+                        current, "upscale", progress_label
+                    )
+                    if success and refined:
+                        prompt_entry.set_text(refined)
+                        enhanced[0] = True
+                        self._update_progress(
+                            progress_label,
+                            "✅ Prompt refined with DeepSeek - review it before continuing",
+                        )
+                    else:
+                        self._update_progress(progress_label, f"❌ {message}")
+                finally:
+                    enhance_button.set_label("Enhance with DeepSeek")
+                    enhance_button.set_sensitive(self._deepseek_ready())
+                    self._flush_ui()
+
+            enhance_button.connect("clicked", on_enhance_clicked)
+
             content_area.show_all()
 
             # Keeps the dialog responsive to Cancel while the request runs
@@ -2857,10 +3772,15 @@ class GimpAIPlugin(Gimp.PlugIn):
                     response = dialog.run()
                     if response == Gtk.ResponseType.OK:
                         provider = self._get_provider()
+                        if not self._set_operation_availability(
+                            ok_button, provider, "upscale"
+                        ):
+                            continue
                         if not self._credentials_ready(provider):
                             self._show_settings_dialog(dialog)
                             provider = self._get_provider()
                             refresh_model_info()
+                            self._refresh_enhance_button(enhance_button)
                             if not self._credentials_ready(provider):
                                 continue
                             if api_warning_bar:
@@ -2871,6 +3791,11 @@ class GimpAIPlugin(Gimp.PlugIn):
 
                         variant = variants[max(0, combo.get_active())]
                         prompt = prompt_entry.get_text().strip()
+                        if prompt and not enhanced[0]:
+                            prompt = self._maybe_refine_prompt(
+                                prompt, "upscale", progress_label
+                            )
+                            prompt_entry.set_text(prompt)
                         self.config.setdefault("bedrock", {})["upscale_variant"] = variant
                         self.config["last_upscale_prompt"] = prompt
                         self._save_config()
@@ -2885,6 +3810,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                     if response in (Gtk.ResponseType.APPLY, Gtk.ResponseType.HELP):
                         self._show_settings_dialog(dialog)
                         refresh_model_info()
+                        self._refresh_enhance_button(enhance_button)
                         if self._credentials_ready(self._get_provider()):
                             if api_warning_bar:
                                 api_warning_bar.hide()
@@ -2900,6 +3826,9 @@ class GimpAIPlugin(Gimp.PlugIn):
             def retry_dialog():
                 ok_button.set_sensitive(True)
                 ok_button.set_label("Upscale")
+                self._set_operation_availability(
+                    ok_button, self._get_provider(), "upscale"
+                )
                 return wait_for_options()
 
             self._retry_dialog = retry_dialog
@@ -2950,16 +3879,49 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"DEBUG: Upscale failed: {e}")
             return False, f"Upscale failed: {str(e)}", None
 
-    def _call_upscale_threaded(self, variant, image_data, prompt, progress_label=None):
-        """Threaded wrapper so the UI stays responsive during the upscale"""
-        def operation():
-            success, message, data = self._call_bedrock_upscale(
-                variant, image_data, prompt, progress_label
+    def _call_custom_upscale(self, image_data, original_size, prompt, progress_label=None):
+        """Experimental 4x upscale through an image-to-image edits request."""
+        width, height = original_size
+        size = f"{width * 4}x{height * 4}"
+        prompt = prompt.strip() or (
+            "Upscale this image with sharp, natural fine detail while preserving "
+            "its content, composition and identity."
+        )
+        ok, message, response = self._call_custom_edit(
+            image_data, None, prompt, size, progress_label
+        )
+        if not ok:
+            return False, message, None
+        try:
+            data = custom_provider.response_image_bytes(
+                self.config, response, opener=self._make_url_request
             )
+            return True, "Upscale successful", data
+        except Exception as e:
+            return False, str(e), None
+
+    def _call_upscale_threaded(
+        self, variant, image_data, prompt, progress_label=None, original_size=None
+    ):
+        """Threaded wrapper so the UI stays responsive during the upscale"""
+        provider = self._get_provider()
+
+        def operation():
+            if provider == "custom":
+                success, message, data = self._call_custom_upscale(
+                    image_data, original_size, prompt, progress_label
+                )
+            else:
+                success, message, data = self._call_bedrock_upscale(
+                    variant, image_data, prompt, progress_label
+                )
             return {"success": success, "message": message, "data": data}
 
         return self._run_threaded_operation(
-            operation, f"Bedrock {variant} upscale", progress_label, max_wait_time=420
+            operation,
+            f"{provider} {variant} upscale",
+            progress_label,
+            max_wait_time=self._custom_timeout() + 30 if provider == "custom" else 420,
         )
 
     def _export_layer_for_upscale(self, layer, variant):
@@ -2968,9 +3930,12 @@ class GimpAIPlugin(Gimp.PlugIn):
         cannot accept it at full size.
         """
         width, height = layer.get_width(), layer.get_height()
-        send_width, send_height = bedrock_client.upscale_input_size(
-            variant, width, height
-        )
+        if self._get_provider() == "custom":
+            send_width, send_height = width, height
+        else:
+            send_width, send_height = bedrock_client.upscale_input_size(
+                variant, width, height
+            )
 
         temp_image = Gimp.Image.new(width, height, Gimp.ImageBaseType.RGB)
         try:
@@ -3055,15 +4020,57 @@ class GimpAIPlugin(Gimp.PlugIn):
             print(f"DEBUG: Bedrock generation failed: {e}")
             return False, f"Bedrock generation failed: {str(e)}", None
 
+    def _call_custom_generation(self, prompt, size, progress_label=None):
+        """Call the custom provider and return decoded image bytes."""
+        if custom_provider is None:
+            return False, "custom_provider.py is missing - reinstall the plugin", None
+        try:
+            if progress_label:
+                self._update_progress(progress_label, "Sending request to custom backend...")
+            data = custom_provider.generate_image(
+                self.config, prompt, size, opener=self._make_url_request
+            )
+            return True, "Image generation successful", data
+        except urllib.error.HTTPError as e:
+            message = custom_provider.format_http_error(e)
+            print(f"DEBUG: Custom generation failed: {message}")
+            return False, message, None
+        except Exception as e:
+            print(f"DEBUG: Custom generation failed: {e}")
+            return False, str(e), None
+
+    def _call_custom_edit(self, image_data, mask_data, prompt, size, progress_label=None):
+        """Call custom /v1/images/edits without OpenAI-only parameters."""
+        if custom_provider is None:
+            return False, "custom_provider.py is missing - reinstall the plugin", None
+        try:
+            response = custom_provider.edit_image(
+                self.config,
+                prompt,
+                size,
+                image_data,
+                mask_data,
+                opener=self._make_url_request,
+            )
+            return True, "Custom backend edit successful", response
+        except urllib.error.HTTPError as e:
+            message = custom_provider.format_http_error(e)
+            print(f"DEBUG: Custom edit failed: {message}")
+            return False, message, None
+        except Exception as e:
+            print(f"DEBUG: Custom edit failed: {e}")
+            return False, str(e), None
+
     def _call_openai_generation(
-        self, prompt, api_key, size="auto", progress_label=None
+        self, prompt, api_key, size="auto", progress_label=None,
+        model=None, base_url="https://api.openai.com/v1", provider_label="OpenAI",
     ):
-        """Call OpenAI GPT-Image API for image generation with progress updates"""
+        """Call an OpenAI-compatible image generation API with progress updates"""
         try:
             import json
             import urllib.request
 
-            model = self._get_openai_model()
+            model = model or self._get_openai_model()
             print(f"DEBUG: Calling {model} generation API with prompt: {prompt}")
 
             # Determine optimal size
@@ -3085,7 +4092,7 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             # Create the request
             json_data = json.dumps(data).encode("utf-8")
-            url = "https://api.openai.com/v1/images/generations"
+            url = f"{base_url.rstrip('/')}/images/generations"
             req = urllib.request.Request(url, data=json_data)
             req.add_header("Content-Type", "application/json")
             req.add_header("Authorization", f"Bearer {api_key}")
@@ -3128,14 +4135,28 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
-            print(f"ERROR: OpenAI generation HTTP error: {e.code} - {error_body}")
-            return False, f"OpenAI image API error {e.code}: {error_body[:200]}", None
+            if e.code == 404 and provider_label == "DeepSeek":
+                return (
+                    False,
+                    "DeepSeek's public API has no image endpoint (404). "
+                    "DeepSeek can rewrite prompts, but images must come from "
+                    "OpenAI, Amazon Bedrock or a compatible gateway. Set "
+                    "deepseek.image_base_url in Settings, or switch provider.",
+                    None,
+                )
+            print(f"ERROR: {provider_label} generation HTTP error: {e.code} - {error_body}")
+            return (
+                False,
+                f"{provider_label} image API error {e.code}: {error_body[:200]}",
+                None,
+            )
         except Exception as e:
-            print(f"ERROR: OpenAI generation API call failed: {str(e)}")
+            print(f"ERROR: {provider_label} generation API call failed: {str(e)}")
             return False, str(e), None
 
     def _call_openai_reference_generation(
-        self, prompt, api_key, references, size, progress_label=None
+        self, prompt, api_key, references, size, progress_label=None,
+        model=None, base_url="https://api.openai.com/v1", provider_label="OpenAI",
     ):
         """
         Generate from a prompt plus reference images (PNG bytes). Text-only
@@ -3143,7 +4164,8 @@ class GimpAIPlugin(Gimp.PlugIn):
         without a mask. Returns raw image bytes like _call_openai_generation.
         """
         success, message, response = self._call_openai_edit(
-            list(references), None, prompt, api_key, size, progress_label
+            list(references), None, prompt, api_key, size, progress_label,
+            model=model, base_url=base_url, provider_label=provider_label,
         )
         if not success:
             return False, message, None
@@ -3162,28 +4184,54 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         exact_size: width x height was picked by the user for a new image,
         rather than taken from an existing canvas.
-        references: reference images as PNG bytes (OpenAI only).
+        references: reference images as PNG bytes (OpenAI and DeepSeek).
         """
         provider = self._get_provider()
-        openai_size = self._openai_generation_size(width, height, exact_size)
+        if provider == "bedrock":
+            api_size = None
+        elif provider == "deepseek":
+            api_size = self._deepseek_generation_size(width, height, exact_size)
+        elif provider == "custom":
+            api_size = self._custom_generation_size(width, height)
+        else:
+            api_size = self._openai_generation_size(width, height, exact_size)
 
         def operation():
             if provider == "bedrock":
                 success, message, data = self._call_bedrock_generation(
                     prompt, width, height, progress_label
                 )
+            elif provider == "deepseek":
+                base_url, model = self._get_deepseek_image_settings()
+                if references:
+                    success, message, data = self._call_openai_reference_generation(
+                        prompt, api_key, references, api_size, progress_label,
+                        model=model, base_url=base_url, provider_label="DeepSeek",
+                    )
+                else:
+                    success, message, data = self._call_openai_generation(
+                        prompt, api_key, api_size, progress_label,
+                        model=model, base_url=base_url, provider_label="DeepSeek",
+                    )
+            elif provider == "custom":
+                success, message, data = self._call_custom_generation(
+                    prompt, api_size, progress_label
+                )
             elif references:
                 success, message, data = self._call_openai_reference_generation(
-                    prompt, api_key, references, openai_size, progress_label
+                    prompt, api_key, references, api_size, progress_label
                 )
             else:
                 success, message, data = self._call_openai_generation(
-                    prompt, api_key, openai_size, progress_label
+                    prompt, api_key, api_size, progress_label
                 )
             return {"success": success, "message": message, "data": data}
 
         return self._run_threaded_operation(
-            operation, f"{provider} generation API call", progress_label
+            operation,
+            f"{provider} generation API call",
+            progress_label,
+            max_wait_time=self._custom_timeout() + 30 if provider == "custom" else 300,
         )
 
     def _call_openai_generation_threaded(
@@ -4205,10 +5253,13 @@ class GimpAIPlugin(Gimp.PlugIn):
         api_key,
         size="1024x1024",
         progress_label=None,
+        model=None,
+        base_url="https://api.openai.com/v1",
+        provider_label="OpenAI",
     ):
-        """Call OpenAI GPT-Image-1 API for image editing (supports single image or array)"""
+        """Call an OpenAI-compatible image edits API (single image or array)"""
         try:
-            print(f"DEBUG: Calling GPT-Image-1 API with prompt: {prompt}")
+            print(f"DEBUG: Calling {provider_label} image edit API with prompt: {prompt}")
 
             # Validate inputs
             if not prompt or not prompt.strip():
@@ -4258,10 +5309,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 }
                 return True, "API call successful (mock - no API key)", mock_response
 
-            url = "https://api.openai.com/v1/images/edits"
+            url = f"{base_url.rstrip('/')}/images/edits"
 
             # Prepare multipart form data
-            model = self._get_openai_model()
+            model = model or self._get_openai_model()
             fields = {
                 "model": model,
                 "prompt": prompt,
@@ -4548,11 +5599,24 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8") if hasattr(e, "read") else str(e)
-            print(f"DEBUG: OpenAI image API HTTP error: {e.code} - {error_body}")
-            return False, f"OpenAI image API error {e.code}: {error_body[:200]}", None
+            if e.code == 404 and provider_label == "DeepSeek":
+                return (
+                    False,
+                    "DeepSeek's public API has no image endpoint (404). "
+                    "DeepSeek can rewrite prompts, but images must come from "
+                    "OpenAI, Amazon Bedrock or a compatible gateway. Set "
+                    "deepseek.image_base_url in Settings, or switch provider.",
+                    None,
+                )
+            print(f"DEBUG: {provider_label} image API HTTP error: {e.code} - {error_body}")
+            return (
+                False,
+                f"{provider_label} image API error {e.code}: {error_body[:200]}",
+                None,
+            )
         except Exception as e:
-            print(f"DEBUG: OpenAI image API call failed: {e}")
-            return False, f"OpenAI image API call failed: {str(e)}", None
+            print(f"DEBUG: {provider_label} image API call failed: {e}")
+            return False, f"{provider_label} image API call failed: {str(e)}", None
 
     def _convert_mask_to_luminance(self, mask_data):
         """
@@ -4826,7 +5890,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             return False, f"Bedrock erase failed: {str(e)}", None
 
     def _run_bedrock_variations(self, count, make_call, progress_label=None,
-                                name="Bedrock variations"):
+                                name="Bedrock variations", max_wait_time=300):
         """
         Produce `count` alternative results and return those that succeeded.
 
@@ -4873,7 +5937,9 @@ class GimpAIPlugin(Gimp.PlugIn):
                 "data": results,
             }
 
-        return self._run_threaded_operation(operation, name, progress_label)
+        return self._run_threaded_operation(
+            operation, name, progress_label, max_wait_time=max_wait_time
+        )
 
     def _place_variation_layers(self, image, results, context_info, label):
         """
@@ -4919,6 +5985,16 @@ class GimpAIPlugin(Gimp.PlugIn):
                 success, message, response = self._call_bedrock_edit(
                     image_data, mask_data, prompt, progress_label
                 )
+            elif provider == "deepseek":
+                base_url, model = self._get_deepseek_image_settings()
+                success, message, response = self._call_openai_edit(
+                    image_data, mask_data, prompt, api_key, size, progress_label,
+                    model=model, base_url=base_url, provider_label="DeepSeek",
+                )
+            elif provider == "custom":
+                success, message, response = self._call_custom_edit(
+                    image_data, mask_data, prompt, size, progress_label
+                )
             else:
                 success, message, response = self._call_openai_edit(
                     image_data, mask_data, prompt, api_key, size, progress_label
@@ -4926,7 +6002,10 @@ class GimpAIPlugin(Gimp.PlugIn):
             return {"success": success, "message": message, "data": response}
 
         return self._run_threaded_operation(
-            operation, f"{provider} edit API call", progress_label
+            operation,
+            f"{provider} edit API call",
+            progress_label,
+            max_wait_time=self._custom_timeout() + 30 if provider == "custom" else 300,
         )
 
     def _call_openai_edit_threaded(
@@ -5350,8 +6429,12 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
 
         source_layer = original_selected_layers[0]
+        provider = self._get_provider()
 
-        if self._get_provider() != "bedrock" or bedrock_client is None:
+        if provider == "custom" and not self._provider_capability(provider, "upscale"):
+            self._show_upscale_dialog()
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+        if provider not in ("bedrock", "custom") or bedrock_client is None:
             Gimp.message(
                 "❌ Generative Upscale requires Amazon Bedrock\n\n"
                 "It uses Stability's upscale models, which have no OpenAI "
@@ -5368,13 +6451,22 @@ class GimpAIPlugin(Gimp.PlugIn):
 
         def attempt():
             """One try at the upscale; returns (headline, details) on failure"""
-            self._log_bedrock_environment()
-            try:
-                bedrock_client.upscale_credentials(
-                    self.config.get("bedrock", {}), variant
-                )
-            except bedrock_client.BedrockError as e:
-                return "Amazon Bedrock is not configured", str(e)
+            provider = self._get_provider()
+            api_prompt = prompt
+            if provider == "custom":
+                if not self._provider_capability(provider, "upscale"):
+                    return "Upscale unavailable", "Enable custom.capabilities.upscale to experiment."
+                if not self._credentials_ready(provider):
+                    return "Invalid Custom provider settings", "Check Settings and try again."
+                api_prompt = self._maybe_enhance_custom_prompt(prompt, progress_label)
+            else:
+                self._log_bedrock_environment()
+                try:
+                    bedrock_client.upscale_credentials(
+                        self.config.get("bedrock", {}), variant
+                    )
+                except bedrock_client.BedrockError as e:
+                    return "Amazon Bedrock is not configured", str(e)
 
             self._update_progress(progress_label, "🔍 Preparing layer...")
             image_data, original_size, sent_size = self._export_layer_for_upscale(
@@ -5395,7 +6487,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             )
 
             ok, message, data = self._call_upscale_threaded(
-                variant, image_data, prompt, progress_label
+                variant, image_data, api_prompt, progress_label, original_size=original_size
             )
             if not ok:
                 if "cancelled" not in message.lower():
@@ -5405,7 +6497,10 @@ class GimpAIPlugin(Gimp.PlugIn):
                 return None
 
             self._update_progress(progress_label, "Placing result...")
-            suffix = "." + bedrock_client.UPSCALE_VARIANTS[variant]["output_format"]
+            suffix = (
+                ".png" if provider == "custom" else
+                "." + bedrock_client.UPSCALE_VARIANTS[variant]["output_format"]
+            )
             new_layer = self._add_layer_from_bytes(
                 image, data, suffix, f"AI Upscale ({variant})",
                 offsets=source_layer.get_offsets()[1:],
@@ -5471,8 +6566,8 @@ class GimpAIPlugin(Gimp.PlugIn):
 
     def _erase_with_openai(self, image, progress_label):
         """
-        Erase Object through the OpenAI edits endpoint; returns (headline,
-        details) on failure, like attempt().
+        Erase Object through an OpenAI-compatible edits endpoint; returns
+        (headline, details) on failure, like attempt().
 
         An approximation of Stability's erase model. Two differences shape it:
         the model regenerates the whole window, so the result is masked back to
@@ -5480,17 +6575,34 @@ class GimpAIPlugin(Gimp.PlugIn):
         outline leaves a ghost, so it is grown first (openai.erase_grow_mask,
         the counterpart of Bedrock's grow_mask) and the layer mask feathered.
         """
-        api_key = self._get_api_key()
-        if not api_key:
+        provider = self._get_provider()
+        is_deepseek = provider == "deepseek"
+        is_custom = provider == "custom"
+        provider_label = (
+            "Custom" if is_custom else "DeepSeek" if is_deepseek else "OpenAI"
+        )
+        if not self._provider_capability(provider, "erase"):
             return (
-                "No OpenAI API key found",
-                "Set your API key in Settings, config.json or the "
-                "OPENAI_API_KEY environment variable.",
+                "Erase unavailable",
+                custom_provider.EDITS_UNAVAILABLE_MESSAGE
+                if is_custom else "Erase is disabled for this provider in config.json",
+            )
+        api_key = self._get_provider_api_key(provider)
+        if not api_key and not is_custom:
+            return (
+                f"No {provider_label} API key found",
+                f"Set your {provider_label} API key in Settings, config.json or "
+                f"the {provider_label.upper()}_API_KEY environment variable.",
             )
 
-        openai_cfg = self.config.get("openai", {})
+        openai_cfg = self.config.get(
+            provider if is_deepseek or is_custom else "openai", {}
+        )
         grow = max(0, min(50, int(openai_cfg.get("erase_grow_mask", 8))))
         variations = max(1, min(4, int(openai_cfg.get("erase_variations", 1))))
+        base_url, model = (
+            self._get_deepseek_image_settings() if is_deepseek else (None, None)
+        )
 
         # Grown for the mask and the layer mask alike, restored afterwards
         original_selection = Gimp.Selection.save(image)
@@ -5499,7 +6611,9 @@ class GimpAIPlugin(Gimp.PlugIn):
                 Gimp.Selection.grow(image, grow)
 
             self._update_progress(progress_label, "🔍 Reading image...")
-            if self._openai_accepts_any_size():
+            if is_custom:
+                context_info = self._calculate_native_context_extraction(image)
+            elif self._provider_accepts_any_size(provider):
                 context_info = self._calculate_gpt_image_context_extraction(image)
             else:
                 context_info = self._calculate_context_extraction(image)
@@ -5517,7 +6631,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             )
 
             api_image_data, prompt = image_data, OPENAI_ERASE_PROMPT
-            if self._openai_mask_hint():
+            if self._provider_mask_hint(provider):
                 # Converted here: GIMP image operations need the main thread
                 api_image_data = [image_data, self._convert_mask_to_luminance(mask_data)]
                 prompt = self._prompt_with_mask_hint(prompt, 0)
@@ -5529,14 +6643,24 @@ class GimpAIPlugin(Gimp.PlugIn):
                 "🚀 Erasing..." if variations == 1
                 else f"🚀 Erasing ({variations} variations)...",
             )
-            # The seed only tells the calls apart; OpenAI takes none
+
+            def make_call(seed):
+                if is_custom:
+                    return self._call_custom_edit(
+                        api_image_data, mask_data, prompt, size, progress_label
+                    )
+                return self._call_openai_edit(
+                    api_image_data, mask_data, prompt, api_key, size,
+                    model=model, base_url=base_url or "https://api.openai.com/v1",
+                    provider_label=provider_label,
+                )
+
             api_success, api_message, results = self._run_bedrock_variations(
                 variations,
-                lambda seed: self._call_openai_edit(
-                    api_image_data, mask_data, prompt, api_key, size
-                ),
+                make_call,
                 progress_label,
-                name="OpenAI erase API call",
+                name=f"{provider_label} erase API call",
+                max_wait_time=self._custom_timeout() + 30 if is_custom else 300,
             )
 
             if not api_success:
@@ -5601,6 +6725,23 @@ class GimpAIPlugin(Gimp.PlugIn):
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
 
         provider = self._get_provider()
+        if not self._provider_capability(provider, "erase"):
+            detail = (
+                custom_provider.EDITS_UNAVAILABLE_MESSAGE
+                if provider == "custom" else
+                "Erase is disabled for this provider in config.json."
+            )
+            Gimp.message(f"❌ Erase Object unavailable\n\n{detail}")
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+        if provider == "deepseek" and self._deepseek_image_endpoint_is_official():
+            Gimp.message(
+                "❌ DeepSeek's public API has no image endpoint!\n\n"
+                "DeepSeek can rewrite prompts, but it cannot inpaint or erase "
+                "image content. Set a compatible image base URL under "
+                "Filters → AI → Settings → DeepSeek, or switch the provider to "
+                "OpenAI or Amazon Bedrock."
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
         if provider == "bedrock":
             self._log_bedrock_environment()
             try:
@@ -5608,9 +6749,17 @@ class GimpAIPlugin(Gimp.PlugIn):
             except bedrock_client.BedrockError as e:
                 Gimp.message(f"❌ Amazon Bedrock is not configured!\n\n{e}")
                 return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
-        elif not self._get_api_key():
+        elif provider == "custom" and not self._credentials_ready(provider):
             Gimp.message(
-                "❌ No OpenAI API key found!\n\n"
+                "❌ Custom provider is not configured\n\n"
+                "Set a valid base URL, timeout and Extra parameters JSON in Settings. "
+                "The API key may be blank."
+            )
+            return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
+        elif provider != "custom" and not self._get_provider_api_key(provider):
+            provider_label = "DeepSeek" if provider == "deepseek" else "OpenAI"
+            Gimp.message(
+                f"❌ No {provider_label} API key found!\n\n"
                 "Set your API key in Filters → AI → Settings, or switch the "
                 "provider to Amazon Bedrock for Stability's dedicated erase model."
             )
@@ -5789,7 +6938,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             image=image,
             provider=self._get_provider(),
             # Bedrock's inpainting takes a single image
-            show_references=self._get_provider() == "openai",
+            show_references=self._get_provider() in ("openai", "deepseek"),
             operation="inpaint",
         )
         print(f"DEBUG: Dialog returned: {repr(dialog_result)}")
@@ -5816,6 +6965,20 @@ class GimpAIPlugin(Gimp.PlugIn):
             # every attempt since Settings may have changed them
             provider = self._get_provider()
             print(f"DEBUG: Inpainting provider: {provider}")
+            if not self._provider_capability(provider, "inpaint"):
+                return (
+                    "Inpainting unavailable",
+                    custom_provider.EDITS_UNAVAILABLE_MESSAGE
+                    if provider == "custom" else
+                    "Inpainting is disabled for this provider in config.json",
+                )
+            if provider == "deepseek" and self._deepseek_image_endpoint_is_official():
+                return (
+                    "DeepSeek cannot edit images",
+                    "DeepSeek's public API has no image endpoint. Set a "
+                    "compatible image base URL under Settings → DeepSeek, or "
+                    "switch the provider to OpenAI or Amazon Bedrock.",
+                )
             api_key = None
             if provider == "bedrock":
                 self._log_bedrock_environment()
@@ -5823,14 +6986,32 @@ class GimpAIPlugin(Gimp.PlugIn):
                     bedrock_client.resolve_credentials(self.config.get("bedrock", {}))
                 except bedrock_client.BedrockError as e:
                     return "Amazon Bedrock is not configured", str(e)
-            else:
-                api_key = self._get_api_key()
-                if not api_key:
-                    return (
-                        "No OpenAI API key found",
-                        "Set your API key in Settings, config.json or the "
-                        "OPENAI_API_KEY environment variable.",
+            elif provider == "custom":
+                try:
+                    settings = custom_provider.resolve_settings(self.config)
+                    if not settings["base_url"]:
+                        raise custom_provider.CustomProviderError(
+                            "Custom provider base URL is required"
+                        )
+                    custom_provider.parse_extra_parameters(
+                        settings["extra_parameters"]
                     )
+                except custom_provider.CustomProviderError as e:
+                    return "Invalid Custom provider settings", str(e)
+            else:
+                api_key = self._get_provider_api_key(provider)
+                if not api_key:
+                    provider_label = (
+                        "DeepSeek" if provider == "deepseek" else "OpenAI"
+                    )
+                    return (
+                        f"No {provider_label} API key found",
+                        f"Set your {provider_label} API key in Settings, "
+                        f"config.json or the {provider_label.upper()}_API_KEY "
+                        "environment variable.",
+                    )
+
+            api_prompt = self._maybe_enhance_custom_prompt(prompt, progress_label)
 
             # Create progress callback for thread-to-UI communication
             progress_callback = self._create_progress_callback(progress_label)
@@ -5841,16 +7022,16 @@ class GimpAIPlugin(Gimp.PlugIn):
 
             self._update_progress(progress_label, "🔍 Processing image...")
 
-            any_size = provider == "openai" and self._openai_accepts_any_size()
+            any_size = self._provider_accepts_any_size(provider)
 
             if mode == "full_image":
                 print("DEBUG: Calculating full-image context extraction...")
                 context_info = self._calculate_full_image_context_extraction(
                     image, any_size=any_size
                 )
-            elif mode == "contextual" and provider == "bedrock":
-                # Native resolution, so the window round-trips without
-                # resampling and can be pasted back whole
+            elif mode == "contextual" and provider in ("bedrock", "custom"):
+                # Native resolution avoids upscaling a small selection for backends
+                # that accept arbitrary request sizes.
                 print("DEBUG: Calculating native-resolution context extraction...")
                 context_info = self._calculate_native_context_extraction(image)
             elif mode == "contextual" and any_size:
@@ -5938,9 +7119,12 @@ class GimpAIPlugin(Gimp.PlugIn):
             else:
                 # References follow the edited image; the mask applies to the
                 # first image only. Exported here, on the main thread.
-                api_image_data, api_prompt = image_data, prompt
-                reference_pngs = self._export_references(self._dialog_references)
-                if self._openai_mask_hint():
+                api_image_data = image_data
+                reference_pngs = (
+                    self._export_references(self._dialog_references)
+                    if provider in ("openai", "deepseek") else []
+                )
+                if self._provider_mask_hint(provider):
                     print("DEBUG: Sending selection as mask hint image")
                     hint_png = self._convert_mask_to_luminance(mask_data)
                     api_image_data = [image_data, hint_png] + reference_pngs
@@ -6117,7 +7301,19 @@ class GimpAIPlugin(Gimp.PlugIn):
             # Step 2: Get credentials for the configured provider; read on
             # every attempt since Settings may have changed them
             provider = self._get_provider()
+            if not self._provider_capability(provider, "composite"):
+                return "Layer Composite unavailable", (
+                    "Composite is disabled for this provider. Enable custom.capabilities."
+                    "composite in config.json for experimentation."
+                )
             api_key = None
+            if provider == "deepseek" and self._deepseek_image_endpoint_is_official():
+                return (
+                    "DeepSeek cannot edit images",
+                    "DeepSeek's public API has no image endpoint. Set a "
+                    "compatible image base URL under Settings → DeepSeek, or "
+                    "switch the provider to OpenAI or Amazon Bedrock.",
+                )
             if provider == "bedrock":
                 self._log_bedrock_environment()
                 try:
@@ -6134,14 +7330,26 @@ class GimpAIPlugin(Gimp.PlugIn):
                         "'Include selection mask', or switch the provider back "
                         "to OpenAI in Settings.",
                     )
-            else:
-                api_key = self._get_api_key()
-                if not api_key:
+            elif provider == "custom":
+                if not self._credentials_ready(provider):
                     return (
-                        "No OpenAI API key found",
-                        "Set your API key in Settings, config.json or the "
-                        "OPENAI_API_KEY environment variable.",
+                        "Invalid Custom provider settings",
+                        "Check the base URL, timeout and Extra parameters JSON in Settings.",
                     )
+            else:
+                api_key = self._get_provider_api_key(provider)
+                if not api_key:
+                    provider_label = (
+                        "DeepSeek" if provider == "deepseek" else "OpenAI"
+                    )
+                    return (
+                        f"No {provider_label} API key found",
+                        f"Set your {provider_label} API key in Settings, "
+                        f"config.json or the {provider_label.upper()}_API_KEY "
+                        "environment variable.",
+                    )
+
+            prompt = self._maybe_enhance_custom_prompt(prompt, progress_label)
 
             # Use existing layer preparation method
             self._update_progress(progress_label, "🔧 Preparing layers...")
@@ -6861,7 +8069,7 @@ class GimpAIPlugin(Gimp.PlugIn):
             size_presets=size_presets,
             allow_custom_size=allow_custom_size,
             # Stability's text-to-image takes no input images
-            show_references=self._get_provider() == "openai",
+            show_references=self._get_provider() in ("openai", "deepseek"),
         )
         if not dialog_result:
             return procedure.new_return_values(Gimp.PDBStatusType.CANCEL, GLib.Error())
@@ -6884,16 +8092,45 @@ class GimpAIPlugin(Gimp.PlugIn):
                     # Credentials for whichever provider is configured; read
                     # on every attempt since Settings may have changed them
                     provider = self._get_provider()
+                    if not self._provider_capability(provider, "generate"):
+                        raise RuntimeError(
+                            "Text-to-image is disabled for this provider in config.json"
+                        )
+                    if (
+                        provider == "deepseek"
+                        and self._deepseek_image_endpoint_is_official()
+                    ):
+                        raise RuntimeError(
+                            "DeepSeek's public API has no image endpoint. Set a "
+                            "compatible image base URL under Settings → DeepSeek, "
+                            "or switch the provider to OpenAI or Amazon Bedrock."
+                        )
                     api_key = None
                     if provider == "bedrock":
                         self._log_bedrock_environment()
                         bedrock_client.generation_credentials(
                             self.config.get("bedrock", {})
                         )
+                    elif provider == "custom":
+                        settings = custom_provider.resolve_settings(self.config)
+                        if not settings["base_url"]:
+                            raise RuntimeError("Custom provider base URL is required")
+                        custom_provider.parse_extra_parameters(
+                            settings["extra_parameters"]
+                        )
                     else:
-                        api_key = self._get_api_key()
+                        api_key = self._get_provider_api_key(provider)
                         if not api_key:
-                            raise RuntimeError("API key not available")
+                            provider_label = (
+                                "DeepSeek" if provider == "deepseek" else "OpenAI"
+                            )
+                            raise RuntimeError(
+                                f"{provider_label} API key not available"
+                            )
+
+                    api_prompt = self._maybe_enhance_custom_prompt(
+                        prompt, progress_label
+                    )
 
                     # Use threaded generation to keep UI responsive like other functions
                     self._update_progress(
@@ -6906,7 +8143,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                         width, height = image.get_width(), image.get_height()
 
                     reference_pngs = []
-                    if provider == "openai":
+                    if provider in ("openai", "deepseek"):
                         reference_pngs = self._export_references(
                             self._dialog_references
                         )
@@ -6916,7 +8153,7 @@ class GimpAIPlugin(Gimp.PlugIn):
                             )
 
                     success, message, image_data = self._call_generation_threaded(
-                        prompt,
+                        api_prompt,
                         api_key,
                         width,
                         height,

@@ -12,11 +12,11 @@ do not like it.
 
 | Menu item | Page | Providers |
 |---|---|---|
-| Inpainting | [Inpainting](inpainting.md) | OpenAI, Bedrock |
-| Erase Object | [Erase Object](erase-object.md) | Bedrock (recommended), OpenAI |
+| Inpainting | [Inpainting](inpainting.md) | OpenAI, Bedrock, DeepSeek-compatible |
+| Erase Object | [Erase Object](erase-object.md) | Bedrock (recommended), OpenAI, DeepSeek-compatible |
 | Generative Upscale | [Generative Upscale](generative-upscale.md) | Bedrock |
-| Generate Layer, Generate New Image | [Image Generation](image-generation.md) | OpenAI, Bedrock |
-| Layer Composite | [Layer Composite](layer-composite.md) | OpenAI, Bedrock |
+| Generate Layer, Generate New Image | [Image Generation](image-generation.md) | OpenAI, Bedrock, DeepSeek-compatible |
+| Layer Composite | [Layer Composite](layer-composite.md) | OpenAI, Bedrock, DeepSeek-compatible |
 | Settings... | [Configuration](../configuration.md) | |
 
 If a request fails, the dialog stays open with the error and a **Try Again**

@@ -7,7 +7,8 @@ nav_order: 1
 # Inpainting
 
 **Fill selected areas with AI-generated content using text prompts.**
-Works with OpenAI and Amazon Bedrock.
+Works with OpenAI, Amazon Bedrock and DeepSeek (through an OpenAI-compatible
+image endpoint).
 
 <!-- Screenshot: docs/assets/screenshots/inpainting.png -->
 
@@ -24,7 +25,7 @@ Works with OpenAI and Amazon Bedrock.
    model drew outside the selection. The layer mask is still created, just
    disabled, so the clip is one click away (`Layer → Mask → Disable Layer Mask`) and
    the mask can be painted to allow only part of the overflow
-7. **Reference images** (OpenAI only, optional): pick other open images for the
+7. **Reference images** (OpenAI and DeepSeek, optional): pick other open images for the
    model to draw on. Two slots are shown; **Add reference** adds more
 8. **Result**: New layer with AI-generated content, masked to the selection
 

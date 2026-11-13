@@ -4,7 +4,7 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 
 ## Project Overview
 
-**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (the current version is the `VERSION` constant in `gimp-ai-plugin.py`) supporting OpenAI's GPT-Image models for inpainting, image generation, and layer compositing, plus Amazon Bedrock (Stability AI) as an alternative provider.
+**GIMP AI Plugin** is a Python plugin for GIMP 3.0+ that integrates AI image generation capabilities directly into GIMP. This is a beta release (the current version is the `VERSION` constant in `gimp-ai-plugin.py`) supporting OpenAI's GPT-Image models for inpainting, image generation, and layer compositing, plus Amazon Bedrock (Stability AI) as an alternative provider. DeepSeek is available as a provider through an OpenAI-compatible image endpoint and as an optional prompt rewriter.
 
 ### Key Features
 - **AI Inpainting**: Fill selected areas with AI-generated content using text prompts and selection masks
@@ -12,6 +12,9 @@ This file provides guidance to GitHub Copilot when working with code in this rep
 - **AI Generative Upscale**: Enlarge the active layer with Stability's upscale models (Bedrock only)
 - **AI Image Generation**: Create images from text, as a new layer (Generate Layer) or a new image (Generate New Image); OpenAI can also take reference images
 - **AI Layer Composite**: Intelligently blend AI content into existing images
+- **DeepSeek Provider and Prompt Refinement**: Select DeepSeek as the image
+  provider through an OpenAI-compatible image endpoint, and/or rewrite prompts
+  with DeepSeek before they reach the image model
 - **Zero External Dependencies**: Uses only Python standard library + GIMP APIs
 
 ## Technology Stack
@@ -45,7 +48,15 @@ This file provides guidance to GitHub Copilot when working with code in this rep
     `output_format` only and caps sides at 1536px; conservative and creative
     require a non-empty prompt. All three must request WebP, because a large
     PNG response exceeds Bedrock's 16MB payload cap
-  - SigV4-signed with the standard library (see `bedrock_client.py`)
+   - SigV4-signed with the standard library (see `bedrock_client.py`)
+- **DeepSeek Chat API** (`https://api.deepseek.com/chat/completions`)
+   - OpenAI-compatible chat completions; **no official image generation endpoint**
+   - Models: `deepseek-flash` (default) and `deepseek-v4-pro`
+   - Used to rewrite prompts for the image provider; never makes images itself
+   - Provider entry sends `/images/generations` and `/images/edits` to
+     `deepseek.image_base_url` (default `https://api.deepseek.com/v1`), which
+     only works with a compatible gateway
+   - Optional; `deepseek_client.py` can be missing without breaking the plugin
 
 ## Architecture
 
@@ -80,7 +91,21 @@ This file provides guidance to GitHub Copilot when working with code in this rep
      name `bedrock` (not `bedrock-runtime`), and the model id's colon must be
      percent-encoded once in the URL and twice in the canonical request
 
-4. **`install.py`** / **`install_simple.py`**
+4. **`deepseek_client.py`** (Prompt refinement, ~300 lines)
+   - **Pure functions with no GIMP dependencies** (unit testable, `python3 deepseek_client.py` self-checks)
+   - Builds OpenAI-compatible chat requests, parses replies, reports API errors
+   - Operation-aware system prompts for generate, inpaint, composite, erase, upscale
+   - Falls back to `DEEPSEEK_API_KEY` when the config has no key; DeepSeek's
+     official API has no image endpoint, so the provider entry is for an
+     OpenAI-compatible gateway and the prompt rewriting works out of the box
+
+5. **`custom_provider.py`** (Custom OpenAI-compatible provider)
+   - Pure stdlib image generation/edit and optional local prompt enhancement
+   - Validates base URLs, timeouts and Extra parameters JSON; optional blank auth
+   - Capability defaults and endpoint probes; edits 404/501 disables inpaint/erase
+   - Offline tests: `python3 -m unittest tests.test_custom_provider`
+
+6. **`install.py`** / **`install_simple.py`**
    - Installation scripts for copying files to GIMP plugin directories
 
 ### Key Design Principles
@@ -118,10 +143,16 @@ class MyPlugin(Gimp.PlugIn):
 ```
 
 ### Configuration Management
-- `api_provider` selects the inpainting provider: `"openai"` or `"bedrock"`
+- `api_provider` selects the image provider: `"openai"`, `"bedrock"`, `"deepseek"` or `"custom"`
 - OpenAI settings live under the `"openai"` key (api_key, model, mask_hint)
 - Bedrock settings live under the `"bedrock"` key (region, model_id, api_key,
   profile, erase/inpaint variations, generation region, upscale options)
+- DeepSeek settings live under the `"deepseek"` key (api_key, model, base_url,
+  image_model, image_base_url, accepts_any_size, mask_hint, erase tuning,
+  auto_enhance, timeout); the key also falls back to `DEEPSEEK_API_KEY`
+- Custom settings live under `"custom"` (base_url, optional api_key, timeout,
+  extra_parameters, capabilities); local prompt enhancement lives under
+  `"prompt_enhancement"` and is off by default
 - Config is stored in `<GIMP profile>/gimp-ai-plugin/config.json` (`Gimp.directory()`)
 - Fallback locations: `~/.config/gimp-ai/config.json`, `~/.gimp-ai-config.json`, local `config.json`
 - Never commit real API keys to the repository
@@ -164,11 +195,14 @@ class MyPlugin(Gimp.PlugIn):
 # Offline: signing, credentials, request bodies for every model
 python3 bedrock_client.py
 
+# Offline: DeepSeek request/response and error handling
+python3 deepseek_client.py
+
 # Offline: coordinate transformations and native context windows
 python3 tests/run_tests.py
 python3 tests/test_native_context.py
 
-# Unit tests (for coordinate_utils.py)
+# Unit tests (for coordinate_utils.py and deepseek_client.py)
 python3 -m pytest tests/
 
 # Manual testing in GIMP
@@ -187,6 +221,8 @@ mkdir -p ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 cp gimp-ai-plugin.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 cp coordinate_utils.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 cp bedrock_client.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
+cp deepseek_client.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
+cp custom_provider.py ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/
 chmod +x ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
 ```
 
@@ -196,9 +232,9 @@ chmod +x ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
 - **Windows**: `%APPDATA%\GIMP\3.0\plug-ins\`
 
 ### Validation Steps
-1. **Syntax check**: `python3 -m py_compile gimp-ai-plugin.py coordinate_utils.py bedrock_client.py`
-2. **Import test**: `python3 -c "import coordinate_utils"`
-2b. **Bedrock self-check**: `python3 bedrock_client.py`
+1. **Syntax check**: `python3 -m py_compile gimp-ai-plugin.py coordinate_utils.py bedrock_client.py deepseek_client.py custom_provider.py`
+2. **Import test**: `python3 -c "import coordinate_utils, deepseek_client, custom_provider"`
+2b. **Self-checks**: `python3 bedrock_client.py`, `python3 deepseek_client.py` and `python3 -m unittest tests.test_custom_provider`
 3. **GIMP recognition**: Plugin appears in Filters → AI menu after restart
 
 ### No External Dependencies to Manage
@@ -240,6 +276,31 @@ See `coordinate_utils.py` `get_optimal_openai_shape()`:
 6. **Create layer mask** to limit visibility to original selection
 
 Detailed algorithms documented in `docs/developers/algorithms.md`.
+
+## DeepSeek Integration
+
+- DeepSeek's official API is OpenAI-compatible chat completions only. The
+  **prompt refinement** path uses that API to rewrite prompts for whichever
+  image provider is selected.
+- The **provider** path is different: it sends OpenAI-compatible
+  `/images/generations` and `/images/edits` requests to
+  `deepseek.image_base_url`. It only works with a gateway that implements
+  those endpoints; do not claim the official API can make images.
+- `_refine_prompt_with_deepseek()` runs the call through
+  `_run_threaded_operation` and returns `(success, message, refined_prompt)`.
+- `_maybe_refine_prompt()` applies `deepseek.auto_enhance`, keeping the
+  original prompt when the request fails.
+- Prompt dialogs show an **Enhance with DeepSeek** button
+  (`_create_enhance_button`). The button is disabled until a key is configured;
+  call `_refresh_enhance_button` after Settings closes.
+- Keep `deepseek_client.py` free of GIMP imports. `enhance_prompt()` accepts an
+  `opener` so the plugin can reuse `_make_url_request` (SSL fallback).
+- Never send a prompt to DeepSeek when the user has not configured a key or
+  enabled automatic refinement.
+- Provider-specific helpers: `_get_provider_api_key()`,
+  `_provider_accepts_any_size()`, `_provider_mask_hint()`,
+  `_get_deepseek_image_settings()`; keep these in sync with
+  `_call_edit_threaded()` and `_call_generation_threaded()`.
 
 ## Documentation
 

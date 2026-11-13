@@ -19,14 +19,16 @@ Common issues and solutions for the GIMP AI Plugin.
 
 **Solutions**:
 
-1. **Verify you installed all three files** in the correct structure:
+1. **Verify you installed all five files** in the correct structure:
 
    ```
    plug-ins/
    └── gimp-ai-plugin/          ← Must be this exact folder name
        ├── gimp-ai-plugin.py    ← Required file #1
        ├── coordinate_utils.py  ← Required file #2
-       └── bedrock_client.py    ← Required file #3
+       ├── bedrock_client.py    ← Required file #3
+       ├── deepseek_client.py   ← Required file #4
+       └── custom_provider.py   ← Required file #5
    ```
 
 2. **Check plugin directory location for your OS**:
@@ -61,19 +63,21 @@ Common issues and solutions for the GIMP AI Plugin.
 - Use matching directory (3.0 vs 3.1)
 - Install in correct version-specific folder
 
-### Missing coordinate_utils.py or bedrock_client.py File
+### Missing coordinate_utils.py, bedrock_client.py, deepseek_client.py or custom_provider.py File
 
 **Symptoms**: Plugin appears but crashes when used, or error about missing module.
 Without `bedrock_client.py` the plugin still loads, but Amazon Bedrock is
-unavailable and every feature falls back to OpenAI.
+unavailable and every feature falls back to OpenAI. Without
+`deepseek_client.py`, the DeepSeek prompt buttons are unavailable. Without
+`custom_provider.py`, the Custom provider is unavailable.
 
-**Solution**: You need all three files for the plugin to work:
+**Solution**: You need all five files for the full feature set:
 
-1. Make sure `coordinate_utils.py` and `bedrock_client.py` are in the same folder as `gimp-ai-plugin.py`
-2. All three files must be in the `gimp-ai-plugin` subdirectory
+1. Make sure `coordinate_utils.py`, `bedrock_client.py`, `deepseek_client.py` and `custom_provider.py` are in the same folder as `gimp-ai-plugin.py`
+2. All five files must be in the `gimp-ai-plugin` subdirectory
 3. Download the release ZIP from GitHub to get them together
 
-> **Tip**: The release ZIP package includes all three files in the correct structure. See [Installation, Step 1](installation.md#step-1-download-the-plugin-files).
+> **Tip**: The release ZIP package includes all five files in the correct structure. See [Installation, Step 1](installation.md#step-1-download-the-plugin-files).
 
 ---
 
@@ -100,6 +104,34 @@ unavailable and every feature falls back to OpenAI.
 2. **Check key format**: Should start with `sk-`
 3. **Test key**: Try in OpenAI playground first
 4. **Account status**: Ensure OpenAI account has credits
+
+### DeepSeek Prompt Refinement Fails
+
+**Symptoms**: "DeepSeek API error ..." in a prompt dialog, or automatic
+refinement is skipped and the original prompt is used
+
+**Solutions**:
+
+1. **Check the key**: Get one at
+   [platform.deepseek.com](https://platform.deepseek.com/api_keys) and paste it
+   under **DeepSeek** in Settings (or set `DEEPSEEK_API_KEY`)
+2. **Check credits**: DeepSeek requires a funded account for API calls
+3. **Check the model**: `deepseek-flash` is the default; `deepseek-v4-pro` also
+   works. A different model name returns an error
+4. **Remember the split**: DeepSeek only rewrites prompts. If image generation
+   fails, the OpenAI or Bedrock credentials are the problem, not DeepSeek
+5. **Turn off automatic refinement** if you would rather keep the original
+   prompt and use the **Enhance with DeepSeek** button manually
+
+### "DeepSeek image API error 404"
+
+DeepSeek's public API (`api.deepseek.com`) serves text and vision only - it has
+no `/images/generations` or `/images/edits` endpoint. A 404 there is expected.
+
+- Keep **Inpainting Provider** on OpenAI or Amazon Bedrock and use DeepSeek only
+  for prompt refinement, or
+- Set **Image API base URL** under Settings → DeepSeek to an OpenAI-compatible
+  gateway that implements those endpoints
 
 ### Settings Not Persisting
 

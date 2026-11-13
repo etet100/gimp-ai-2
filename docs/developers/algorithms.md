@@ -17,6 +17,7 @@ Which sizing path is used depends on the provider and model:
 |---|---|---|
 | OpenAI gpt-image-1 | Three fixed shapes, content scaled and padded | 1-6 |
 | OpenAI GPT-Image-2.x | Any size in multiples of 16, native resolution | [8](#8-gpt-image-2x-sizing) |
+| DeepSeek-compatible images | Any size by default (`deepseek.accepts_any_size`) | [8](#8-gpt-image-2x-sizing) |
 | Amazon Bedrock (Stability) | Any size, ~1MP native-resolution window | [7](#7-native-resolution-context-window) |
 
 ## OpenAI gpt-image-1 Constraints
