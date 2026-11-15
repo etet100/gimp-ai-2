@@ -204,7 +204,13 @@ def get_gimp_plugins_dir():
     return None
 
 
-PLUGIN_FILES = ["gimp-ai-plugin.py", "coordinate_utils.py", "bedrock_client.py"]
+PLUGIN_FILES = [
+    "gimp-ai-plugin.py",
+    "coordinate_utils.py",
+    "bedrock_client.py",
+    "deepseek_client.py",
+    "custom_provider.py",
+]
 
 
 def find_plugin_files():

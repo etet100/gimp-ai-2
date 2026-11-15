@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Custom OpenAI-compatible provider**: connect to a local or LAN server such
+  as stable-diffusion.cpp with an optional API key and a 600s default timeout.
+  Text-to-image uses `/v1/images/generations`; inpainting and erase use
+  `/v1/images/edits`, with graceful capability degradation on HTTP 404/501.
+  Settings include Extra parameters JSON, a latency/endpoint connection test,
+  per-provider capability overrides, and optional local chat-completion prompt
+  enhancement (off by default). Upscale and composite are disabled by default;
+  their config overrides enable experimental edits-based paths
+- **DeepSeek prompt assistant and provider**: DeepSeek appears in the
+  Inpainting Provider dropdown and can rewrite prompts before they reach an
+  image model. Prompt dialogs gain an **Enhance with DeepSeek** button, and
+  Settings can refine prompts automatically (`deepseek.auto_enhance`). The
+  provider entry calls an OpenAI-compatible image endpoint at
+  `deepseek.image_base_url`; the official DeepSeek API has no image endpoint,
+  so on `api.deepseek.com` use DeepSeek for prompt refinement and keep OpenAI
+  or Bedrock for images. Configured through the `deepseek` section of
+  `config.json` or the `DEEPSEEK_API_KEY` environment variable
 - **Erase Object on OpenAI**: no longer Bedrock-only. With the OpenAI provider
   it runs prompted inpainting with a fixed removal prompt (no new objects, text
   or people), the selection grown by `openai.erase_grow_mask` (default 8px) so

@@ -7,7 +7,8 @@ nav_order: 5
 # Layer Composite
 
 **Intelligently combine multiple visible layers using AI guidance.**
-Works with OpenAI and Amazon Bedrock.
+Works with OpenAI, Amazon Bedrock and DeepSeek-compatible OpenAI image
+endpoints.
 
 <!-- Screenshot: docs/assets/screenshots/layer-composite.png -->
 

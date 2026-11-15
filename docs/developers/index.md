@@ -6,14 +6,16 @@ has_children: true
 
 # Developers
 
-The plugin is three Python files with no dependencies beyond the standard
+The plugin is five Python files with no dependencies beyond the standard
 library and GIMP's GObject Introspection bindings.
 
 | File | Role |
 |---|---|
-| `gimp-ai-plugin.py` | Procedure registration, dialogs, OpenAI and Bedrock calls, the GIMP image pipeline |
+| `gimp-ai-plugin.py` | Procedure registration, dialogs, provider dispatch and the GIMP image pipeline |
 | `coordinate_utils.py` | Pure coordinate math - context windows, shapes, padding, scaling. No GIMP imports, unit tested |
 | `bedrock_client.py` | SigV4 signing and Bedrock request building with `hmac`/`hashlib` - no boto3. No GIMP imports |
+| `deepseek_client.py` | OpenAI-compatible chat requests that rewrite prompts. No GIMP imports, unit tested |
+| `custom_provider.py` | Custom image/chat requests, validation, capabilities and endpoint probes. No GIMP imports, unit tested |
 
 ## In this section
 
@@ -27,8 +29,11 @@ library and GIMP's GObject Introspection bindings.
 
 ```bash
 python3 bedrock_client.py              # signing, credentials, request bodies
+python3 deepseek_client.py             # prompt requests, responses, errors
+python3 -m unittest tests.test_custom_provider  # custom provider, no network
 python3 tests/run_tests.py             # coordinate transformations
 python3 tests/test_native_context.py
+python3 -m pytest tests/               # unit tests, including DeepSeek
 
 # These run inside GIMP; some make live Bedrock calls
 gimp -i --batch-interpreter=python-fu-eval \

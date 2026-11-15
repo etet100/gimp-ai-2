@@ -6,7 +6,8 @@ nav_order: 4
 
 # Image Generation
 
-**Create images from a text description.** Works with OpenAI and Amazon Bedrock.
+**Create images from a text description.** Works with OpenAI, Amazon Bedrock
+and DeepSeek-compatible OpenAI image endpoints.
 
 <!-- Screenshot: docs/assets/screenshots/image-generation.png -->
 
@@ -26,7 +27,7 @@ There are two entries:
    presets up to 4K and a custom size, rounded to multiples of 16; sizes above
    2560x1440 are marked experimental by OpenAI. gpt-image-1 and Bedrock offer
    the shapes their models support
-4. **Reference images** (OpenAI only, optional): pick open images to guide the
+4. **Reference images** (OpenAI and DeepSeek, optional): pick open images to guide the
    result - the request then goes to OpenAI's edits endpoint without a mask
 
 {: .note }

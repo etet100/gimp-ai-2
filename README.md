@@ -23,9 +23,12 @@ mask, compare and undo.
 - 🔍 **Generative Upscale** - enlarge a layer up to 4x with real detail instead of blur
 - 🖼️ **Image Generation** - text to image as a new layer or a new file, optionally guided by reference images
 - 🔄 **Layer Composite** - blend pasted-in elements naturally into a scene
+- ✨ **DeepSeek Prompt Refinement** - rewrite prompts for better results, manually or automatically
 
-Powered by **OpenAI GPT-Image** (2.5 Flare, 2.5 Sunburst, gpt-image-1) or
-**Amazon Bedrock** (Stability AI) - your choice, your API key.
+Powered by **OpenAI GPT-Image** (2.5 Flare, 2.5 Sunburst, gpt-image-1),
+**Amazon Bedrock** (Stability AI), a **DeepSeek**-compatible OpenAI image
+endpoint, or your own **Custom (OpenAI-compatible)** server. A DeepSeek key or
+a local chat model can also rewrite prompts before they reach the image model.
 
 ## See it in action
 
@@ -47,14 +50,14 @@ Works even with no image open.
 
 - **Non-destructive** - every result is a new layer; your original stays untouched
 - **Zero dependencies** - pure Python standard library, nothing to `pip install`
-- **Three files, one installer** - works on Windows, macOS and Linux
+- **Five files, one installer** - works on Windows, macOS and Linux
 - **Retries built in** - a failed request keeps the dialog open with a Try Again button
 
 ## Quick install
 
 1. Download the [latest release ZIP](https://github.com/etet100/gimp-ai-2/releases/latest) and extract it
 2. Run `python3 install_plugin.py`
-3. Restart GIMP, open `Filters → AI → Settings...` and enter your OpenAI API key or AWS credentials
+3. Restart GIMP, open `Filters → AI → Settings...` and enter your OpenAI API key or AWS credentials (optionally add a DeepSeek key for prompt refinement)
 
 | Everything lives under `Filters → AI` | Pick a provider and model in Settings |
 |:---:|:---:|
@@ -62,6 +65,26 @@ Works even with no image open.
 
 Requires **GIMP 3.0.4 or newer**. Prefer to copy files by hand, or using a
 Flatpak/Snap build? See the [installation guide](https://etet100.github.io/gimp-ai-2/installation.html).
+
+## Custom (OpenAI-compatible) provider
+
+For a self-hosted stable-diffusion.cpp `sd-server.exe` or another compatible
+server, choose **Custom (OpenAI-compatible)** in Settings and enter:
+
+- **Base URL** - for example `http://192.168.1.50:8080` (do not append `/v1`)
+- **API key** - optional; leave blank for an unauthenticated local server
+- **Timeout seconds** - 600 by default, so slow first-time model loads can finish
+- **Extra parameters (JSON)** - optional sd.cpp fields such as
+  `{"steps": 20, "cfg_scale": 7, "sampling_method": "euler"}`
+
+Click **Test** to measure latency and probe generations/edits. Text-to-image uses
+`/v1/images/generations`; inpainting and erase use `/v1/images/edits` when the
+server provides it. A 404/501 disables those two edit features with a clear
+message instead of crashing. Upscale and composite are off by default, and their
+experimental config overrides depend on backend support. Optional local LLM
+prompt enhancement is off by default and only runs for this provider. See the
+[configuration reference](https://etet100.github.io/gimp-ai-2/configuration.html)
+for all keys and limitations.
 
 ## Documentation
 
