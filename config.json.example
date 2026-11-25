@@ -24,6 +24,41 @@
         "upscale_variant": "conservative",
         "upscale_creativity": 0.35
     },
+    "deepseek": {
+        "api_key": "",
+        "model": "deepseek-flash",
+        "base_url": "https://api.deepseek.com",
+        "image_model": "deepseek-flash",
+        "image_base_url": "https://api.deepseek.com/v1",
+        "accepts_any_size": true,
+        "mask_hint": true,
+        "erase_variations": 1,
+        "erase_grow_mask": 8,
+        "auto_enhance": false,
+        "timeout": 60
+    },
+    "custom": {
+        "base_url": "http://192.168.1.50:8080",
+        "api_key": "",
+        "timeout": 600,
+        "extra_parameters": "{\"steps\": 20, \"cfg_scale\": 7, \"sampling_method\": \"euler\"}",
+        "erase_variations": 1,
+        "erase_grow_mask": 8,
+        "capabilities": {
+            "t2i": true,
+            "inpaint": true,
+            "erase": true,
+            "upscale": false,
+            "composite": false
+        }
+    },
+    "prompt_enhancement": {
+        "enabled": false,
+        "endpoint": "http://192.168.1.50:8081/v1/chat/completions",
+        "model": "local-model",
+        "api_key": "",
+        "timeout": 120
+    },
     "settings": {
         "image_quality": 0.85,
         "max_image_size": 1024,

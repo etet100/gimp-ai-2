@@ -8,7 +8,8 @@ nav_order: 2
 
 **Remove an unwanted object and fill the gap from the surrounding image.**
 Works best with Amazon Bedrock, which has Stability's purpose-built
-object-erase model. With OpenAI it works too, as an approximation - see
+object-erase model. With OpenAI, or a DeepSeek-compatible OpenAI image
+endpoint, it works too as an approximation - see
 [With OpenAI](#with-openai).
 
 <!-- Screenshot: docs/assets/screenshots/erase-object.png -->

@@ -50,11 +50,13 @@ The installation process is simple:
 
 ## Step 1: Download the Plugin Files
 
-You need **exactly 3 files**:
+You need **exactly 5 files**:
 
 1. **`gimp-ai-plugin.py`** - The main plugin file
 2. **`coordinate_utils.py`** - Helper functions (required)
 3. **`bedrock_client.py`** - Amazon Bedrock support (required)
+4. **`deepseek_client.py`** - DeepSeek prompt refinement (required)
+5. **`custom_provider.py`** - Custom OpenAI-compatible provider (required)
 
 ### Option A: Download Release Package with Automated Installer (Easiest!)
 
@@ -75,16 +77,16 @@ You need **exactly 3 files**:
 
 1. Go to the [Releases page](https://github.com/etet100/gimp-ai-2/releases)
 2. Download the latest `gimp-ai-plugin-vX.X.X.zip` file
-3. Extract the ZIP file - you'll see a `gimp-ai-plugin` folder containing all three files
+3. Extract the ZIP file - you'll see a `gimp-ai-plugin` folder containing all five files
 
 ### Option C: Download Individual Files
 
 1. Go to the [GitHub repository](https://github.com/etet100/gimp-ai-2)
 2. Click on `gimp-ai-plugin.py` → Click "Raw" → Save the file (Ctrl+S or Cmd+S)
 3. Go back and click on `coordinate_utils.py` → Click "Raw" → Save the file
-4. Do the same for `bedrock_client.py`
+4. Do the same for `bedrock_client.py`, `deepseek_client.py` and `custom_provider.py`
 
-> **Important**: Keep these three files together - the plugin won't work without all of them!
+> **Important**: Keep these five files together - the plugin won't work without all of them!
 
 ---
 
@@ -172,7 +174,9 @@ plug-ins/
 └── gimp-ai-plugin/          ← Create this folder
     ├── gimp-ai-plugin.py    ← Copy this file here
     ├── coordinate_utils.py  ← Copy this file here
-    └── bedrock_client.py    ← Copy this file here
+    ├── bedrock_client.py    ← Copy this file here
+    ├── deepseek_client.py   ← Copy this file here
+    └── custom_provider.py   ← Copy this file here
 ```
 
 ### How to Create the Folder
@@ -202,7 +206,7 @@ mkdir ~/.config/GIMP/3.0/plug-ins/gimp-ai-plugin
 
 ## Step 4: Copy the Plugin Files
 
-Now copy **all three files** you downloaded into the `gimp-ai-plugin` folder you just created.
+Now copy **all five files** you downloaded into the `gimp-ai-plugin` folder you just created.
 
 ### Where to Copy:
 
@@ -214,8 +218,10 @@ Now copy **all three files** you downloaded into the `gimp-ai-plugin` folder you
 - ✅ `gimp-ai-plugin.py`
 - ✅ `coordinate_utils.py`
 - ✅ `bedrock_client.py`
+- ✅ `deepseek_client.py`
+- ✅ `custom_provider.py`
 
-All three files must be in the same `gimp-ai-plugin` folder!
+All five files must be in the same `gimp-ai-plugin` folder!
 
 ---
 
@@ -296,6 +302,12 @@ Now you'll set up your OpenAI API key so the plugin can access AI features.
 
 The plugin will **automatically save** your API key to its `config.json` in the GIMP profile folder - you only need to enter it once!
 
+> **Optional - DeepSeek prompt refinement:** add a DeepSeek API key under
+> **DeepSeek Prompt Assistant** in the same Settings dialog to rewrite prompts
+> before they are sent to OpenAI or Bedrock. See
+> [Configuration → DeepSeek prompt assistant](configuration.md#deepseek-prompt-assistant).
+> You still need an OpenAI or Bedrock key to generate images.
+
 ---
 
 ## Step 8: Test the Plugin
@@ -329,11 +341,13 @@ Let's verify everything is working:
 **Check these things:**
 
 1. ✅ **Did you restart GIMP completely?** (Quit and reopen)
-2. ✅ **Are all three files in the right place?**
+2. ✅ **Are all five files in the right place?**
    ```
    plug-ins/gimp-ai-plugin/gimp-ai-plugin.py
    plug-ins/gimp-ai-plugin/coordinate_utils.py
    plug-ins/gimp-ai-plugin/bedrock_client.py
+   plug-ins/gimp-ai-plugin/deepseek_client.py
+   plug-ins/gimp-ai-plugin/custom_provider.py
    ```
 3. ✅ **Is the folder named exactly `gimp-ai-plugin`?** (not `gimp_ai_plugin` or `gimp-ai`)
 4. ✅ **Do you have GIMP 3.0.4 or newer?** Check: `Help` → `About GIMP`

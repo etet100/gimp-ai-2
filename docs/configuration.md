@@ -16,9 +16,18 @@ Everything is set in `Filters → AI → Settings...`. The plugin stores it in
 
 ## Choosing a provider
 
-**Inpainting Provider** in Settings picks OpenAI or Amazon Bedrock. The choice
-applies to every feature. Generative Upscale exists only on Bedrock. Erase
-Object works on both, but Bedrock's dedicated erase model gives cleaner results.
+**Inpainting Provider** in Settings picks OpenAI, Amazon Bedrock, DeepSeek or
+Custom (OpenAI-compatible). The choice applies to every feature. Generative
+Upscale uses Bedrock by default; Custom also has an experimental, disabled-by-
+default edits-based path. Erase Object works on all four, but Bedrock's
+dedicated erase model gives cleaner results.
+
+**DeepSeek caveat:** the public DeepSeek API serves text and vision only - it
+has no image endpoint. Selecting *DeepSeek* therefore calls an
+OpenAI-compatible image API at the URL in the `deepseek` section, which only
+works if you point it at a gateway that offers one. On the official API, use
+DeepSeek for prompt refinement ([below](#deepseek-prompt-assistant)) and keep
+OpenAI or Bedrock as the image provider.
 
 ## OpenAI
 
@@ -49,6 +58,84 @@ Erase Object on OpenAI reads two more keys from the `openai` section:
 |---|---|---|
 | `erase_variations` | `1` | How many alternatives Erase Object produces (1-4). Each one is a separate, billed request |
 | `erase_grow_mask` | `8` | Pixels the selection is grown by before erasing (0-50), so the object's edge and halo go too |
+
+## DeepSeek prompt assistant
+
+DeepSeek is a text model, not an image generator: its API has no equivalent of
+the GPT-Image or Stability endpoints. The plugin therefore uses it to **rewrite
+the prompt** you type, then sends the improved prompt to whichever image
+provider you selected above. Every feature that asks for a prompt gets an
+**Enhance with DeepSeek** button, and Settings can do it automatically.
+
+The provider dropdown also offers **DeepSeek (OpenAI-compatible images)**. That
+entry sends `/images/generations` and `/images/edits` requests to
+`deepseek.image_base_url` using your DeepSeek key. The official
+`api.deepseek.com` does not implement those endpoints today; it only works if
+you point the URL at a compatible gateway. If you just want DeepSeek to improve
+prompts, leave the provider on OpenAI or Bedrock.
+
+1. **Get a DeepSeek API key** from [platform.deepseek.com](https://platform.deepseek.com/api_keys)
+2. In GIMP: go to `Filters → AI → Settings...`
+3. Under **DeepSeek Prompt Assistant**, paste the key
+4. Pick the prompt model:
+   - **DeepSeek Flash** - fast and cheap, the default (`deepseek-flash`)
+   - **DeepSeek V4 Pro** - slower, more detailed rewrites (`deepseek-v4-pro`)
+5. Optionally tick **Refine prompts automatically before generating**
+6. Click Save
+
+Press **Enhance with DeepSeek** in a prompt dialog to rewrite the text in place
+for review; nothing is sent to the image provider until you press OK. With
+automatic refinement on, the prompt is rewritten when you press OK (unless you
+already used the button), and the original prompt is kept if DeepSeek cannot be
+reached.
+
+The API key can also come from the `DEEPSEEK_API_KEY` environment variable.
+The base URL defaults to `https://api.deepseek.com` and can be changed for a
+compatible proxy.
+
+## Custom (OpenAI-compatible)
+
+Use this provider for stable-diffusion.cpp `sd-server.exe` or another partial
+OpenAI-compatible image server on your machine or LAN.
+
+1. Start the server with its OpenAI-compatible API enabled.
+2. In GIMP Settings, choose **Custom (OpenAI-compatible)**.
+3. Set **Base URL** to the server root, for example
+   `http://192.168.1.50:8080`. The plugin appends `/v1/images/generations` or
+   `/v1/images/edits`; do not include `/v1` yourself. Trailing slashes are
+   normalized, and only HTTP(S) URLs without traversal segments are accepted.
+4. Leave **API key** blank unless your server requires one. Keys are stored like
+   the other provider secrets in plain-text `config.json` with mode 600 attempted.
+5. Leave **Timeout seconds** at 600 on slow hardware (30-3600 is accepted).
+6. Optionally set **Extra parameters (JSON)** to an object such as
+   `{"steps": 20, "cfg_scale": 7, "sampling_method": "euler"}`. These fields are
+   merged into generation and edit requests. Invalid JSON or a non-object shows
+   a validation error. OpenAI-only `quality`, `moderation` and `background` are
+   never sent and are rejected if included here.
+
+**Test** runs a minimal generation (64x64 with one step, falling back to 256x256
+when the small request is rejected), reports latency, and probes the edits
+endpoint with OPTIONS. An edits probe can be reported as unknown on servers
+that do not answer OPTIONS; an actual edit returning 404/501 disables Custom
+inpainting and erase for the current configuration. Generation remains available.
+
+The backend must accept the multipart image/mask edit format and return either
+`b64_json` or a URL in OpenAI's `data` array. The plugin does not send `model`,
+`quality`, `moderation`, `background`, `input_fidelity`, or mask-hint images to
+this provider. Reference-image generation is not available. Upscale and
+composite are disabled by default; enabling them is experimental and uses the
+edits endpoint (4x image-to-image for upscale), so results depend on the build.
+
+### Prompt enhancement
+
+The separate **Prompt enhancement** section calls an OpenAI-compatible
+`/v1/chat/completions` endpoint, for example a local KoboldCpp server. Set the
+full endpoint URL, model name, optional API key and timeout (default 120s), then
+enable the toggle. It is **off by default** and only runs when Custom is the
+image provider. The enhanced description replaces the prompt for generation,
+inpainting and any experimentally enabled custom operations. Any failure keeps
+the original prompt and notes the fallback in the status line without an error
+dialog. Your prompt is sent to this endpoint only while the toggle is enabled.
 
 ## Amazon Bedrock
 
@@ -121,6 +208,54 @@ A complete example is in
 | `api_key` | — | OpenAI API key |
 | `model` | `gpt-image-2.5-flare` | `gpt-image-2.5-flare`, `gpt-image-2.5-sunburst` or `gpt-image-1` |
 | `mask_hint` | `true` | Send the selection as an extra hint image (2.x models only) |
+
+### `deepseek` section
+
+| Key | Default | Meaning |
+|---|---|---|
+| `api_key` | — | DeepSeek API key (falls back to `DEEPSEEK_API_KEY`) |
+| `model` | `deepseek-flash` | Prompt model: `deepseek-flash` or `deepseek-v4-pro` |
+| `base_url` | `https://api.deepseek.com` | Prompt API base URL |
+| `auto_enhance` | `false` | Rewrite prompts automatically before sending them to the image provider |
+| `timeout` | `60` | Seconds to wait for a prompt rewrite (5-300) |
+| `image_model` | `model` | Model sent to the OpenAI-compatible image endpoint |
+| `image_base_url` | `https://api.deepseek.com/v1` | Base URL for `/images/generations` and `/images/edits` when DeepSeek is the provider |
+| `accepts_any_size` | `true` | Let the image endpoint choose from free sizes instead of the three gpt-image-1 shapes |
+| `mask_hint` | `true` | Send the selection as an extra hint image to the image endpoint |
+| `erase_variations`, `erase_grow_mask` | `1`, `8` | Erase Object tuning for the DeepSeek-compatible image endpoint |
+
+### `custom` section
+
+| Key | Default | Meaning |
+|---|---|---|
+| `base_url` | empty | Required HTTP(S) server root; `/v1/images/...` is appended automatically |
+| `api_key` | empty | Optional bearer token; blank omits the Authorization header |
+| `timeout` | `600` | Image request timeout in seconds (30-3600) |
+| `extra_parameters` | empty string | JSON object merged into generation and edit requests |
+| `erase_variations` | `1` | Number of erase results (1-4); each is a separate request |
+| `erase_grow_mask` | `8` | Pixels to grow the selection before erase (0-50) |
+| `capabilities.t2i` | `true` | Generate Layer / Generate New Image |
+| `capabilities.inpaint` | `true` | Inpainting; set false automatically after edits 404/501 |
+| `capabilities.erase` | `true` | Erase Object; set false automatically after edits 404/501 |
+| `capabilities.upscale` | `false` | Experimental 4x image-to-image edits request |
+| `capabilities.composite` | `false` | Experimental multi-image edits request |
+
+The same five `capabilities` keys can be overridden in the `openai`, `bedrock`
+or `deepseek` sections. Their defaults preserve existing behavior: all support
+text-to-image, inpainting, erase and composite; only Bedrock supports upscale.
+Automatic edits-endpoint detection changes the in-memory Custom configuration;
+saving Settings persists it. Re-enable the flags after upgrading to a native
+stable-diffusion.cpp API build with edits support.
+
+### `prompt_enhancement` section
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Enhance prompts only when the Custom provider is selected |
+| `endpoint` | empty | Full HTTP(S) `/v1/chat/completions` URL |
+| `model` | empty | Chat model name required when enhancement is enabled |
+| `api_key` | empty | Optional bearer token; blank omits Authorization |
+| `timeout` | `120` | Enhancement request timeout in seconds (30-3600) |
 
 ### `bedrock` section
 

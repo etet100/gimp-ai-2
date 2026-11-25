@@ -3,7 +3,7 @@
 Build release package for GIMP AI Plugin
 
 Creates a ZIP file containing:
-- gimp-ai-plugin/ folder with both required .py files
+- gimp-ai-plugin/ folder with the required .py files
 - Installation instructions
 - License
 
@@ -61,7 +61,9 @@ def create_release_package():
     plugin_files = [
         "gimp-ai-plugin.py",
         "coordinate_utils.py",
-        "bedrock_client.py"
+        "bedrock_client.py",
+        "deepseek_client.py",
+        "custom_provider.py"
     ]
     
     # Copy plugin files
@@ -140,7 +142,9 @@ OPTION 2: MANUAL INSTALLATION
    └── gimp-ai-plugin/
        ├── gimp-ai-plugin.py
        ├── coordinate_utils.py
-       └── bedrock_client.py
+       ├── bedrock_client.py
+       ├── deepseek_client.py
+       └── custom_provider.py
 
 3. SET PERMISSIONS (Linux/macOS only):
    
@@ -155,7 +159,8 @@ AFTER INSTALLATION:
 2. 🔑 CONFIGURE API KEY:
    
    In GIMP: Filters → AI → Settings
-   Enter your OpenAI API key (from platform.openai.com)
+   Enter your OpenAI API key (from platform.openai.com), AWS credentials,
+   or a DeepSeek key / compatible image endpoint
 
 3. 🎨 TEST THE PLUGIN:
 
